@@ -7,8 +7,9 @@
 #   bash nixos-btrfs-install.sh
 #
 # Jede Abfrage lässt sich per Umgebungsvariable vorbelegen, z. B.:
-#   DISK=/dev/nvme0n1 CHANNEL=release KB=de LOCALE=de_DE.UTF-8 DESKTOP=plasma FLATPAK=j \
-#   UNFREE=j ENCRYPT=j UKI=n SILENT=j AUTOUPDATE=n LOGIN_SHELL=zsh OHMYZSH=j \
+#   DISK=/dev/nvme0n1 CHANNEL=release KB=de LOCALE=de_DE.UTF-8 DESKTOP=plasma DESKTOP_MODE=minimal \
+#   GPU=amd PRINTING=j BLUETOOTH=j STEAM=n FLATPAK=j UNFREE=j ENCRYPT=j UKI=n TPM2=n SILENT=j \
+#   SNAPPER=j AUTOUPDATE=n LOGIN_SHELL=zsh OHMYZSH=j SSHD=n \
 #   NIX_HOSTNAME=nixos NIX_USER=alice SWAP_GB=8 bash nixos-btrfs-install.sh
 #
 #   CHANNEL     release (neuestes stabiles Release) | unstable
@@ -16,9 +17,13 @@
 #   LOCALE      z. B. de_DE.UTF-8 oder en_US.UTF-8+de_DE.UTF-8 (Sprache + Formate)
 #   DESKTOP     gnome | plasma | cosmic | xfce | cinnamon | none
 #   DESKTOP_MODE minimal (Desktop, Terminal, Dateimanager, Editor) | full (alle Standard-Apps)
+#   GPU         intel | amd | nvidia | nvidia-prime | nouveau | generic
 #   LOGIN_SHELL bash | zsh
+#   SSH_KEYS    öffentlicher Schlüssel oder gh:<GitHub-Name>
 # Ohne Abfrage, nur per Variable: TIMEZONE (Europe/Berlin), ESP_GB (1), COMPRESS (zstd),
-#   KERNEL (latest = neuester stabiler Kernel | lts = Standard-Kernel des Releases)
+#   KERNEL (latest = neuester stabiler Kernel | lts = Standard-Kernel des Releases), ZRAM (j)
+#
+# Das komplette Protokoll landet in /var/log/nixos-install.log des neuen Systems.
 
 set -Eeuo pipefail
 
@@ -26,7 +31,14 @@ set -Eeuo pipefail
 c_red=$'\e[31m'; c_grn=$'\e[32m'; c_ylw=$'\e[33m'; c_bld=$'\e[1m'; c_rst=$'\e[0m'
 info() { printf '\n%s==>%s %s%s%s\n' "$c_grn" "$c_rst" "$c_bld" "$*" "$c_rst"; }
 warn() { printf '%s!!%s  %s\n' "$c_ylw" "$c_rst" "$*" >&2; }
-die()  { printf '%sFEHLER:%s %s\n' "$c_red" "$c_rst" "$*" >&2; exit 1; }
+die() {
+  printf '%sFEHLER:%s %s\n' "$c_red" "$c_rst" "$*" >&2
+  if [[ -n ${LOG:-} ]]; then
+    printf 'Protokoll: %s\n' "$LOG" >&2
+    if mountpoint -q /mnt/var/log 2>/dev/null; then cp "$LOG" /mnt/var/log/nixos-install.log 2>/dev/null || true; fi
+  fi
+  exit 1
+}
 trap 'die "Abbruch in Zeile $LINENO: $BASH_COMMAND"' ERR
 
 is_yes() { [[ ${1,,} =~ ^(j|ja|y|yes|1)$ ]]; }
@@ -129,6 +141,34 @@ alias update='sudo nixos-rebuild switch --upgrade'
 EOF
 }
 
+# sysfs-Adresse 0000:01:00.0 -> NixOS-Bus-ID PCI:1:0:0 (dezimal)
+pci_busid() {
+  local a=${1#*:} bus dev fn
+  bus=${a%%:*}; a=${a#*:}; dev=${a%%.*}; fn=${a#*.}
+  printf 'PCI:%d:%d:%d' "0x$bus" "0x$dev" "0x$fn"
+}
+
+# Öffentliche SSH-Schlüssel als Nix-Liste; Eingabe: Schlüssel oder gh:<GitHub-Name>
+ssh_keys_nix() {
+  local input=$1 keys line out=""
+  if [[ $input == gh:* ]]; then
+    keys=$(curl -fsSL --max-time 15 "https://github.com/${input#gh:}.keys" || true)
+    [[ -n $keys ]] || warn "Keine Schlüssel von GitHub für ${input#gh:} erhalten."
+  else
+    keys=$input
+  fi
+  while read -r line; do
+    line=${line//[\"\\\$]/}   # Zeichen entfernen, die in einem Nix-String stören
+    if [[ $line =~ ^(ssh-(ed25519|rsa)|ecdsa-sha2-nistp(256|384|521)|sk-(ssh-ed25519|ecdsa-sha2-nistp256)@openssh\.com)\ [A-Za-z0-9+/=]+ ]]; then
+      out+="
+      \"$line\""
+    elif [[ -n $line ]]; then
+      warn "Kein gültiger SSH-Schlüssel, übersprungen: ${line:0:40}..."
+    fi
+  done <<<"$keys"
+  printf '%s' "$out"
+}
+
 # Neuestes stabiles Release laut status.nixos.org, sonst die Version des Installers
 detect_latest_release() {
   local json rel=""
@@ -211,6 +251,12 @@ reread_partitions() {
 
 # ---------- Vorabprüfungen ----------
 [[ $EUID -eq 0 ]] || die "Bitte als root ausführen (sudo -i)."
+
+# Alles mitschreiben; landet am Ende in /var/log/nixos-install.log des neuen Systems.
+# Passwörter tauchen nicht auf, weil sie ohne Echo eingegeben werden.
+LOG=/tmp/nixos-install-$(date +%Y%m%d-%H%M%S).log
+exec > >(tee -a "$LOG") 2>&1
+echo "Protokoll: $LOG"
 [[ -d /sys/firmware/efi ]] || die "Kein UEFI-Boot erkannt. Den USB-Stick im UEFI-Modus starten."
 for cmd in parted partprobe wipefs mkfs.fat mkfs.btrfs btrfs cryptsetup curl nix-channel nix-instantiate nix-shell nixos-generate-config nixos-install nixos-enter udevadm; do
   command -v "$cmd" >/dev/null || die "'$cmd' fehlt. Läuft das Skript im NixOS-Installer?"
@@ -227,12 +273,10 @@ if [[ -e /dev/mapper/cryptroot ]]; then cryptsetup close cryptroot; fi
 : "${TIMEZONE:=Europe/Berlin}"
 : "${ESP_GB:=1}"
 : "${COMPRESS:=zstd}"
+KERNEL_PRESET=${KERNEL:-}   # per Variable gesetzt? Dann bei NVIDIA nicht nachfragen
 : "${KERNEL:=latest}"
-case $KERNEL in
-  latest) KERNEL_ATTR=linuxPackages_latest ;;
-  lts)    KERNEL_ATTR=linuxPackages ;;
-  *)      die "KERNEL muss latest oder lts sein." ;;
-esac
+: "${ZRAM:=j}"
+if is_yes "$ZRAM"; then ZRAM=1; else ZRAM=0; fi
 [[ $ESP_GB =~ ^[0-9]+$ ]] && (( ESP_GB >= 1 )) || die "ESP_GB muss mindestens 1 sein."
 
 # =====================================================================
@@ -351,6 +395,61 @@ else
   DESKTOP_MODE=none
 fi
 
+# ---------- Grafik ----------
+GPU_FOUND=""; NV_DEV=""; NV_ID=""; IGPU_DEV=""; IGPU_VENDOR=""
+for d in /sys/bus/pci/devices/*; do
+  [[ -r $d/class ]] || continue
+  [[ $(<"$d/class") == 0x03* ]] || continue
+  case $(<"$d/vendor") in
+    0x10de) NV_DEV=${d##*/}; NV_ID=$(<"$d/device"); GPU_FOUND+=" NVIDIA" ;;
+    0x8086) IGPU_DEV=${d##*/}; IGPU_VENDOR=intel; GPU_FOUND+=" Intel" ;;
+    0x1002) if [[ -z $IGPU_DEV ]]; then IGPU_DEV=${d##*/}; IGPU_VENDOR=amd; fi; GPU_FOUND+=" AMD" ;;
+    *)      GPU_FOUND+=" andere" ;;
+  esac
+done
+if [[ $DESKTOP != none ]]; then
+  if [[ -n $NV_DEV && -n $IGPU_DEV ]]; then gdef=4
+  elif [[ -n $NV_DEV ]]; then gdef=3
+  elif [[ $IGPU_VENDOR == amd ]]; then gdef=2
+  elif [[ $IGPU_VENDOR == intel ]]; then gdef=1
+  else gdef=6; fi
+  choose GPU "Grafiktreiber? (erkannt:${GPU_FOUND:- nichts})" "$gdef" \
+    "intel|Intel (Mesa, mit Video-Beschleunigung)" \
+    "amd|AMD (Mesa)" \
+    "nvidia|NVIDIA, proprietärer Treiber" \
+    "nvidia-prime|NVIDIA + Intel/AMD im Laptop (proprietär, PRIME-Offload)" \
+    "nouveau|NVIDIA, freier Treiber nouveau" \
+    "generic|Andere oder virtuelle Maschine (Mesa)"
+  case $GPU in intel|amd|nvidia|nvidia-prime|nouveau|generic) ;; *) die "Unbekannter Grafiktreiber: $GPU" ;; esac
+else
+  GPU=none
+fi
+
+NV_OPEN=${NV_OPEN:-}
+if [[ $GPU == nvidia* ]]; then
+  # Offene Kernelmodule gibt es ab Turing (GTX 16xx/RTX 20xx), PCI-Gerätenummer ab 0x1e00
+  if [[ -n $NV_ID ]] && (( NV_ID >= 0x1e00 )); then odef=j; else odef=n; fi
+  ask_yn NV_OPEN "Offene NVIDIA-Kernelmodule? (ab GTX 16xx/RTX 20xx ja; GTX 9xx/10xx nein, dann Treiber 580)" "$odef"
+  if [[ -z $KERNEL_PRESET ]]; then
+    ask_yn NV_LTS "Mit NVIDIA den LTS-Kernel nehmen? (proprietäre Treiber hinken neuen Kerneln oft hinterher)" j
+    if (( NV_LTS )); then KERNEL=lts; fi
+  fi
+  if [[ $GPU == nvidia-prime && ( -z $NV_DEV || -z $IGPU_DEV ) ]]; then
+    warn "Für PRIME wurden nicht beide GPUs gefunden, nehme den normalen NVIDIA-Treiber."
+    GPU=nvidia
+  fi
+fi
+
+# ---------- Desktop-Extras ----------
+if [[ $DESKTOP != none ]]; then
+  echo
+  ask_yn PRINTING  "Drucker-Unterstützung (CUPS, Netzwerkdrucker automatisch finden)?" j
+  ask_yn BLUETOOTH "Bluetooth?" j
+  ask_yn STEAM     "Steam und Gamemode?" n
+else
+  PRINTING=0; BLUETOOTH=0; STEAM=0
+fi
+
 # ---------- 5. Audio ----------
 echo
 echo "Audio: PipeWire mit ALSA (inkl. 32 bit), PulseAudio- und JACK-Unterstützung wird eingerichtet."
@@ -363,9 +462,20 @@ else
   FLATPAK=0   # Flatpak braucht XDG-Portale, die erst ein Desktop mitbringt
 fi
 ask_yn UNFREE    "Unfreie Pakete erlauben (z. B. NVIDIA-Treiber, Steam)?" j
+if (( ! UNFREE )) && { [[ $GPU == nvidia || $GPU == nvidia-prime ]] || (( STEAM )); }; then
+  warn "NVIDIA-Treiber und Steam brauchen unfreie Pakete, Unfree wird aktiviert."
+  UNFREE=1
+fi
 ask_yn ENCRYPT    "Datenträger mit LUKS verschlüsseln?" n
 ask_yn UKI        "UKI (Unified Kernel Image) über lanzaboote? Bereitet Secure Boot vor" n
+TPM2=${TPM2:-}
+if (( ENCRYPT && UKI )) && [[ $(cat /sys/class/tpm/tpm0/tpm_version_major 2>/dev/null) == 2 ]]; then
+  ask_yn TPM2 "LUKS per TPM2 entsperren vorbereiten? (nach Secure Boot kein Passwort mehr, Passwort bleibt als Rückfall)" j
+else
+  TPM2=0
+fi
 ask_yn SILENT     "Silent Boot (Plymouth-Startbildschirm, minimale Meldungen)?" j
+ask_yn SNAPPER    "Automatische Snapshots für /home (snapper, stündlich, wird ausgedünnt)?" j
 ask_yn AUTOUPDATE "Automatische Updates (nachts, ohne Neustart)?" n
 
 choose LOGIN_SHELL "Welche Shell für den Benutzer?" 1 \
@@ -377,6 +487,16 @@ if [[ $LOGIN_SHELL == zsh ]]; then
   ask_yn OHMYZSH "oh-my-zsh mitinstallieren?" j
 else
   OHMYZSH=0
+fi
+
+ask_yn SSHD "SSH-Zugang einrichten (nur mit Schlüssel, kein Passwort)?" n
+SSH_KEYS_NIX=""
+if (( SSHD )); then
+  ask SSH_KEYS "Öffentlichen Schlüssel einfügen oder gh:<GitHub-Name> (leer = später)" ""
+  if [[ -n ${SSH_KEYS:-} ]]; then SSH_KEYS_NIX=$(ssh_keys_nix "$SSH_KEYS"); fi
+  if [[ -z $SSH_KEYS_NIX ]]; then
+    warn "Ohne Schlüssel ist kein SSH-Login möglich. Später unter users.users.<name>.openssh.authorizedKeys.keys eintragen."
+  fi
 fi
 
 # ---------- Weitere Angaben ----------
@@ -398,6 +518,12 @@ ESP_END_MIB=$(( 1 + ESP_GB * 1024 ))   # Start bei 1 MiB, damit die ESP volle ES
 
 yn() { if (( $1 )); then echo ja; else echo nein; fi; }
 
+case $KERNEL in
+  latest) KERNEL_ATTR=linuxPackages_latest ;;
+  lts)    KERNEL_ATTR=linuxPackages ;;
+  *)      die "KERNEL muss latest oder lts sein." ;;
+esac
+
 # ---------- Zusammenfassung ----------
 info "Zusammenfassung"
 cat <<EOF
@@ -412,15 +538,19 @@ cat <<EOF
   Sprache:        $LANG_LOCALE${FORMAT_LOCALE:+, Formate $FORMAT_LOCALE}
   Zeitzone:       $TIMEZONE
   Desktop:        $DESKTOP$(if [[ $DESKTOP != none ]]; then echo " ($DESKTOP_MODE)"; fi)
+  Grafik:         $GPU$(if [[ $GPU == nvidia* ]]; then echo " (offene Module: $(yn "$NV_OPEN"))"; fi)
+  Extras:         Drucken $(yn "$PRINTING"), Bluetooth $(yn "$BLUETOOTH"), Steam $(yn "$STEAM")
   Audio:          PipeWire (ALSA + 32 bit, Pulse, JACK)
   Flatpak:        $(yn "$FLATPAK")$(if (( FLATPAK )); then echo " (Flathub)"; fi)
   Unfree:         $(yn "$UNFREE")
-  Verschlüsselt:  $(yn "$ENCRYPT")
+  Verschlüsselt:  $(yn "$ENCRYPT")$(if (( TPM2 )); then echo " (TPM2 vorbereitet)"; fi)
+  Snapshots:      $(yn "$SNAPPER")$(if (( SNAPPER )); then echo " (/home, snapper)"; fi)
   Auto-Updates:   $(yn "$AUTOUPDATE")
   Shell:          $LOGIN_SHELL$(if [[ $LOGIN_SHELL == zsh ]]; then echo " (oh-my-zsh: $(yn "$OHMYZSH"))"; fi)
   Hostname:       $NIX_HOSTNAME
   Benutzer:       $NIX_USER
-  Swap:           ${SWAP_GB} GiB
+  Swap:           ${SWAP_GB} GiB Swapfile$(if (( ZRAM )); then echo " + zram"; fi)
+  SSH:            $(yn "$SSHD")$(if (( SSHD )); then if [[ -n $SSH_KEYS_NIX ]]; then echo " ($(grep -c . <<<"$SSH_KEYS_NIX") Schlüssel)"; else echo " (noch ohne Schlüssel)"; fi; fi)
 EOF
 echo
 warn "ALLE Daten auf $DISK werden gelöscht:"
@@ -464,6 +594,7 @@ if (( ENCRYPT )); then
   info "Richte LUKS2 ein – Passphrase zweimal eingeben, danach zum Öffnen ein drittes Mal"
   cryptsetup luksFormat --type luks2 --batch-mode --verify-passphrase "$ROOTPART"
   cryptsetup open "$ROOTPART" cryptroot
+  LUKS_UUID=$(cryptsetup luksUUID "$ROOTPART")
   BTRFS_DEV=/dev/mapper/cryptroot
 else
   BTRFS_DEV=$ROOTPART
@@ -494,6 +625,11 @@ if (( SWAP_GB > 0 )); then
   mount -o "subvol=@swap,noatime" "$BTRFS_DEV" /mnt/swap
 fi
 mount -o umask=077 "$ESP" /mnt/boot
+if (( SNAPPER )); then
+  btrfs subvolume create /mnt/home/.snapshots >/dev/null
+  chmod 750 /mnt/home/.snapshots
+  echo "  @home/.snapshots für snapper"
+fi
 findmnt -R /mnt
 
 # =====================================================================
@@ -575,6 +711,12 @@ LUKS_NIX=""
 if (( ENCRYPT )); then
   LUKS_NIX='  boot.initrd.luks.devices."cryptroot".allowDiscards = true;  # TRIM durch LUKS durchreichen'
 fi
+if (( TPM2 )); then
+  LUKS_NIX+='
+  # TPM2: entsperrt ohne Passwort, sobald "sudo luks-tpm2-enroll" gelaufen ist (nach Secure Boot)
+  security.tpm2.enable = true;
+  boot.initrd.luks.devices."cryptroot".crypttabExtraOpts = [ "tpm2-device=auto" ];'
+fi
 
 FS_NIX="  fileSystems = {
     \"/\".options        = [ \"compress=$COMPRESS\" \"noatime\" ];
@@ -592,6 +734,29 @@ FS_NIX+="
 SWAP_NIX=""
 if (( SWAP_GB > 0 )); then
   SWAP_NIX="  swapDevices = [ { device = \"/swap/swapfile\"; size = $(( SWAP_GB * 1024 )); } ];  # MiB, NixOS legt die Datei inkl. NOCOW an"
+fi
+if (( ZRAM )); then
+  if [[ -n $SWAP_NIX ]]; then SWAP_NIX+=$'\n'; fi
+  SWAP_NIX+='  zramSwap = {
+    enable = true;        # komprimierter Swap im RAM, wird vor dem Swapfile genutzt
+    memoryPercent = 50;
+  };'
+fi
+
+SNAP_NIX=""
+if (( SNAPPER )); then
+  SNAP_NIX="  services.snapper.configs.home = {
+    SUBVOLUME = \"/home\";
+    ALLOW_USERS = [ \"$NIX_USER\" ];  # darf snapper -c home list/undochange
+    SYNC_ACL = true;                # und in /home/.snapshots lesen
+    TIMELINE_CREATE = true;
+    TIMELINE_CLEANUP = true;
+    TIMELINE_LIMIT_HOURLY = 10;
+    TIMELINE_LIMIT_DAILY = 7;
+    TIMELINE_LIMIT_WEEKLY = 4;
+    TIMELINE_LIMIT_MONTHLY = 6;
+    TIMELINE_LIMIT_YEARLY = 0;
+  };"
 fi
 
 SCRUB_NIX='  services.btrfs.autoScrub = {
@@ -650,6 +815,99 @@ if [[ $DESKTOP != none ]]; then
   DESKTOP_NIX+="
   programs.firefox.enable = true;"
 fi
+
+# Grafik
+GPU_NIX=""
+if [[ $GPU != none ]]; then
+  GPU_NIX='  hardware.graphics.enable = true;'
+  if [[ $(uname -m) == x86_64 ]]; then
+    GPU_NIX+='
+  hardware.graphics.enable32Bit = true;  # 32-bit-Treiber für Steam und Wine'
+  fi
+  if [[ $GPU == intel || ( $GPU == nvidia-prime && $IGPU_VENDOR == intel ) ]]; then
+    GPU_NIX+='
+  hardware.graphics.extraPackages = with pkgs; [ intel-media-driver ];  # Video-Beschleunigung (VA-API)'
+  fi
+  if [[ $GPU == amd ]]; then
+    GPU_NIX+='
+  hardware.amdgpu.initrd.enable = true;  # Grafik früh laden, sauberer Startbildschirm'
+  fi
+  if [[ $GPU == nvidia || $GPU == nvidia-prime ]]; then
+    if (( NV_OPEN )); then nvopen=true; else nvopen=false; fi
+    GPU_NIX+="
+  services.xserver.videoDrivers = [ \"nvidia\" ];
+  hardware.nvidia = {
+    modesetting.enable = true;
+    open = $nvopen;          # offene Kernelmodule, ab GTX 16xx/RTX 20xx
+    nvidiaSettings = true;"
+    if (( ! NV_OPEN )); then
+      GPU_NIX+="
+    # Treiber 580 ist der letzte für GTX 9xx/10xx (Maxwell, Pascal, Volta);
+    # noch ältere Karten brauchen legacy_470 oder nouveau
+    package = config.boot.kernelPackages.nvidiaPackages.legacy_580;"
+    fi
+    GPU_NIX+="
+  };"
+  fi
+  if [[ $GPU == nvidia-prime ]]; then
+    if [[ $IGPU_VENDOR == intel ]]; then igpu_opt=intelBusId; else igpu_opt=amdgpuBusId; fi
+    GPU_NIX+="
+  hardware.nvidia.prime = {
+    offload.enable = true;
+    offload.enableOffloadCmd = true;  # Programme mit \"nvidia-offload <programm>\" auf der NVIDIA-GPU starten
+    $igpu_opt = \"$(pci_busid "$IGPU_DEV")\";
+    nvidiaBusId = \"$(pci_busid "$NV_DEV")\";
+  };"
+  fi
+fi
+
+# Desktop-Extras
+EXTRAS_NIX=""
+if (( PRINTING )); then
+  EXTRAS_NIX+='  services.printing.enable = true;
+  services.avahi = {
+    enable = true;
+    nssmdns4 = true;      # Netzwerkdrucker automatisch finden
+    openFirewall = true;
+  };'
+fi
+if [[ $DESKTOP != none ]]; then
+  if [[ -n $EXTRAS_NIX ]]; then EXTRAS_NIX+=$'\n'; fi
+  if (( BLUETOOTH )); then
+    EXTRAS_NIX+='  hardware.bluetooth = {
+    enable = true;
+    powerOnBoot = true;
+  };'
+    if [[ $DESKTOP == xfce ]]; then
+      EXTRAS_NIX+='
+  services.blueman.enable = true;  # Bluetooth-Oberfläche für Xfce'
+    fi
+  else
+    EXTRAS_NIX+='  hardware.bluetooth.enable = false;'
+  fi
+fi
+if (( STEAM )); then
+  EXTRAS_NIX+='
+  programs.steam.enable = true;
+  programs.gamemode.enable = true;  # Spiele mit "gamemoderun %command%" starten'
+fi
+
+SSH_NIX=""
+if (( SSHD )); then
+  SSH_NIX='  services.openssh = {
+    enable = true;
+    settings = {
+      PasswordAuthentication = false;
+      KbdInteractiveAuthentication = false;
+      PermitRootLogin = "no";
+    };
+  };'
+fi
+
+# Programme mit eigener NixOS-Einbindung
+PROGRAMS_NIX='  programs.direnv.enable = true;  # Projektumgebungen, inkl. nix-direnv
+  programs.mtr.enable = true;     # mtr ohne root
+  programs.nh.enable = true;      # nh os switch -f "<nixpkgs/nixos>", nh search, nh clean'
 
 # Minimal: Standard-Apps weglassen, Terminal, Dateimanager und Editor bleiben
 DESKTOP_PKGS=""
@@ -748,9 +1006,15 @@ if [[ $LOGIN_SHELL == zsh ]]; then
   fi
 fi
 
+USER_KEYS=""
+if [[ -n $SSH_KEYS_NIX ]]; then
+  USER_KEYS="
+    openssh.authorizedKeys.keys = [$SSH_KEYS_NIX
+    ];"
+fi
 USER_NIX="  users.users.\"$NIX_USER\" = {
     isNormalUser = true;
-    extraGroups = [ \"wheel\" \"networkmanager\" \"audio\" ];$USER_SHELL
+    extraGroups = [ \"wheel\" \"networkmanager\" \"audio\" ];$USER_SHELL$USER_KEYS
   };"
 
 FLATPAK_NIX=""
@@ -789,15 +1053,56 @@ PKG_NIX='  environment.systemPackages = with pkgs; [
     # btrfs
     btrfs-progs
     compsize            # Kompressionsrate anzeigen
-    # Werkzeuge
+    # Shell-Alltag
     htop
+    btop
+    ripgrep             # rg: schnelle Textsuche
+    fd                  # schnelles find
+    bat                 # cat mit Hervorhebung
+    jq                  # JSON
+    tmux
     tree
     file
+    # Dateien und Archive
     unzip
+    p7zip
     rsync
+    ncdu                # Platzfresser finden
+    lsof                # wer hält eine Datei offen?
+    # Hardware
+    nvme-cli
+    lshw
+    inxi                # Hardware-Übersicht
+    # Netzwerk (mtr über programs.mtr)
+    dnsutils            # dig, nslookup
+    nmap
+    tcpdump
+    iperf3
+    ethtool
+    whois
+    ipcalc
     # NixOS-Helfer
     nix-output-monitor  # nom: lesbare Build-Ausgabe
-    nvd                 # Paketunterschiede zwischen Generationen'
+    nvd                 # Paketunterschiede zwischen Generationen
+    nix-tree            # Speicherverbrauch des Systems untersuchen
+    nix-index           # nix-locate: welches Paket enthält Datei X? (einmal nix-index ausführen)'
+case $DESKTOP in
+  gnome|plasma|cosmic)
+    PKG_NIX+='
+    wl-clipboard        # wl-copy, wl-paste' ;;
+  xfce|cinnamon)
+    PKG_NIX+='
+    xclip               # Zwischenablage im Terminal' ;;
+esac
+if (( SNAPPER )) && [[ $DESKTOP != none ]]; then
+  PKG_NIX+='
+    btrfs-assistant     # Snapshots grafisch verwalten'
+fi
+if (( TPM2 )); then
+  PKG_NIX+="
+    # LUKS an TPM2 binden (PCR 7 = Secure-Boot-Zustand), erst nach dem Aktivieren von Secure Boot
+    (writeShellScriptBin \"luks-tpm2-enroll\" \"exec \${systemd}/bin/systemd-cryptenroll --wipe-slot=tpm2 --tpm2-device=auto --tpm2-pcrs=7 /dev/disk/by-uuid/$LUKS_UUID\")"
+fi
 if [[ $LOGIN_SHELL == zsh ]] && (( OHMYZSH )); then
   PKG_NIX+='
     # zsh: oh-my-zsh und Plugins, geladen in ~/.zshrc
@@ -822,11 +1127,14 @@ PKG_NIX+='
   emit "Verschlüsselung"                     "$LUKS_NIX"
   emit "btrfs-Mount-Optionen (ergänzen subvol=... aus hardware-configuration.nix)" "$FS_NIX"
   emit "Swap"                                "$SWAP_NIX"
+  emit "Snapshots für /home"                 "$SNAP_NIX"
   emit "btrfs-Scrub"                         "$SCRUB_NIX"
   emit "Netzwerk"                            "$NET_NIX"
   emit "Sprache und Zeit"                    "$LOCALE_NIX"
   emit "Tastatur"                            "$KB_NIX"
   emit "Desktop"                             "$DESKTOP_NIX"
+  emit "Grafik"                              "$GPU_NIX"
+  emit "Drucken, Bluetooth, Spiele"          "$EXTRAS_NIX"
   emit "Audio: PipeWire mit ALSA, Pulse und JACK" "$AUDIO_NIX"
   emit "Flatpak"                             "$FLATPAK_NIX"
   emit "Firmware"                            "$FWUPD_NIX"
@@ -834,6 +1142,8 @@ PKG_NIX+='
   emit "Unfreie Pakete"                      "$UNFREE_NIX"
   emit "Automatische Updates"                "$UPDATE_NIX"
   emit "Shell"                               "$SHELL_NIX"
+  emit "SSH"                                 "$SSH_NIX"
+  emit "Programme"                           "$PROGRAMS_NIX"
   emit "Benutzer"                            "$USER_NIX"
   emit "Systempakete"                        "$PKG_NIX"
   emit "Nicht ändern, auch nicht nach Upgrades" "  system.stateVersion = \"$STATE_VERSION\";"
@@ -842,7 +1152,7 @@ PKG_NIX+='
 
 echo "  $CFG geschrieben (Original: configuration.nix.generated)"
 read -rp "configuration.nix vor der Installation ansehen/bearbeiten? [j/N] " edit
-if is_yes "${edit:-n}"; then "${EDITOR:-nano}" "$CFG"; fi
+if is_yes "${edit:-n}"; then "${EDITOR:-nano}" "$CFG" </dev/tty >/dev/tty 2>&1; fi
 
 # =====================================================================
 #  Installation
@@ -892,7 +1202,19 @@ if (( UKI )); then
     3. sudo sbctl enroll-keys --microsoft
     4. Neu starten, prüfen mit: bootctl status
 EOF
+  if (( TPM2 )); then
+    cat <<'EOF'
+    5. sudo luks-tpm2-enroll       -> LUKS-Passwort einmal eingeben, danach entsperrt der TPM
+       Nach Firmware-Updates oder geänderten Secure-Boot-Schlüsseln fragt der Start wieder
+       nach dem Passwort; dann luks-tpm2-enroll erneut ausführen.
+EOF
+  fi
 fi
+if [[ $GPU == nvidia-prime ]]; then
+  echo "  NVIDIA-GPU für ein Programm nutzen: nvidia-offload <programm>"
+fi
+install -m 600 "$LOG" /mnt/var/log/nixos-install.log
+echo "  Protokoll gespeichert unter /var/log/nixos-install.log"
 read -rp "Jetzt aushängen und neu starten? [J/n] " rb
 if [[ ${rb,,} != n* ]]; then
   umount -R /mnt
