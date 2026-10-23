@@ -47,9 +47,15 @@ Die Datei wird nur gelesen, nicht ausgeführt. Hostname, Grafik und Swap-Größe
 
 ## Secure Boot nach der Installation (nur mit UKI)
 
-1. `sudo sbctl verify`
+1. `sudo sbctl verify`: ✓ bei `BOOTX64.EFI`, `systemd-bootx64.efi` und `/EFI/Linux/nixos-generation-*.efi`.
+   **✗ bei `/EFI/nixos/kernel-*.efi` ist richtig so** – die signierte UKI prüft den Kernel über seine Prüfsumme.
+   Den Kernel nicht mit sbctl signieren, sonst startet die Generation nicht mehr („Kernel hash does not match“).
 2. Im Firmware-Setup Secure Boot einschalten und in den Setup Mode setzen
 3. `sudo sbctl enroll-keys --microsoft`, neu starten, `bootctl status`
 4. Mit TPM2: `sudo luks-tpm2-enroll`, danach startet das System ohne LUKS-Passwort
+
+Kernel versehentlich signiert? Signatur aus sbctl entfernen (`sudo sbctl remove-file <datei>`),
+`sudo rm /boot/EFI/nixos/kernel-*.efi` und `sudo nixos-rebuild boot` – lzbt installiert den
+Kernel dann im Original neu.
 
 **Achtung:** Die gewählte Platte wird komplett gelöscht.

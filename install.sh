@@ -1624,7 +1624,11 @@ info "Installation abgeschlossen."
 if (( UKI )); then
   cat <<'EOF'
   Secure Boot ist vorbereitet, aber noch nicht aktiv. Nach dem ersten Start:
-    1. sudo sbctl verify           -> UKIs unter /boot/EFI/Linux sind signiert
+    1. sudo sbctl verify
+       ✓ bei BOOTX64.EFI, systemd-bootx64.efi und /EFI/Linux/nixos-generation-*.efi
+       ✗ bei /EFI/nixos/kernel-*.efi ist richtig so: Die signierte UKI prüft den Kernel
+         über seine Prüfsumme. Den Kernel NICHT mit sbctl signieren, sonst startet die
+         Generation nicht mehr ("Kernel hash does not match").
     2. Im Firmware-Setup Secure Boot einschalten und in den "Setup Mode" setzen
        (nicht "alle Schlüssel löschen")
     3. sudo sbctl enroll-keys --microsoft
