@@ -88,6 +88,75 @@ detect_latest_release() {
   echo "$rel"
 }
 
+# Alle Geräte der Platte samt Partitionen und Geräten darüber (LVM, LUKS, RAID) als echte Pfade
+disk_devs() {
+  lsblk -lnpo NAME "$1" | while read -r d; do realpath "$d"; done
+}
+
+# Löst alles, was die Platte noch belegt: Swap, Mounts, LVM, RAID, LUKS.
+# Ohne das meldet parted "unable to inform the kernel of the change".
+release_disk() {
+  local disk=$1 devs sw src tgt vg name type
+  devs=$(disk_devs "$disk")
+  on_disk() { [[ -n $1 ]] && grep -qxF "$(realpath "$1" 2>/dev/null)" <<<"$devs"; }
+
+  # Swap-Partitionen und Swapfiles auf der Platte
+  while read -r sw _; do
+    [[ $sw == Filename ]] && continue
+    src=$(findmnt -no SOURCE -T "$sw" 2>/dev/null | sed 's/\[.*//' || true)
+    if on_disk "$sw" || on_disk "$src"; then
+      echo "  swapoff $sw"
+      swapoff "$sw"
+    fi
+  done < /proc/swaps
+
+  # Mounts, tiefste zuerst
+  while read -r tgt; do
+    echo "  umount $tgt"
+    umount "$tgt" 2>/dev/null || umount -l "$tgt"
+  done < <(findmnt -rno TARGET,SOURCE | while read -r tgt src; do
+             src=${src%%\[*}
+             [[ -b $src ]] && on_disk "$src" && printf '%s\n' "$tgt"
+           done | sort -r)
+
+  # LVM-Volume-Groups auf der Platte deaktivieren
+  if command -v pvs >/dev/null; then
+    while read -r dev; do
+      vg=$(pvs --noheadings -o vg_name "$dev" 2>/dev/null | tr -d ' ' || true)
+      if [[ -n $vg ]]; then
+        echo "  vgchange -an $vg"
+        vgchange -an "$vg" >/dev/null
+      fi
+    done <<<"$devs"
+  fi
+
+  # LUKS und RAID von oben nach unten schließen
+  while read -r name type; do
+    case $type in
+      crypt) echo "  cryptsetup close ${name##*/}"; cryptsetup close "${name##*/}" ;;
+      raid*) echo "  mdadm --stop $name"; mdadm --stop "$name" >/dev/null ;;
+    esac
+  done < <(lsblk -lnpo NAME,TYPE "$disk" | tac)
+
+  udevadm settle
+}
+
+# Kernel die neue Partitionstabelle einlesen lassen und prüfen, dass er die neuen Größen sieht
+reread_partitions() {
+  local disk=$1 want_esp=$(( ESP_GB * 1024 * 1024 * 1024 )) i
+  for i in 1 2 3 4 5 6 7 8 9 10; do
+    udevadm settle
+    partprobe "$disk" 2>/dev/null || partx -u "$disk" 2>/dev/null || blockdev --rereadpt "$disk" 2>/dev/null || true
+    udevadm settle
+    if [[ -b $ESP && -b $ROOTPART ]] && [[ $(lsblk -bdno SIZE "$ESP") == "$want_esp" ]]; then
+      return 0
+    fi
+    sleep 1
+  done
+  lsblk -po NAME,SIZE,TYPE,MOUNTPOINTS "$disk" >&2
+  die "Der Kernel sieht die neuen Partitionen auf $disk nicht. Irgendetwas hält die Platte noch fest. Neu starten und das Skript erneut ausführen."
+}
+
 # ---------- Vorabprüfungen ----------
 [[ $EUID -eq 0 ]] || die "Bitte als root ausführen (sudo -i)."
 [[ -d /sys/firmware/efi ]] || die "Kein UEFI-Boot erkannt. Den USB-Stick im UEFI-Modus starten."
@@ -133,9 +202,13 @@ choose DISK "Auf welchen Datenträger soll NixOS? (wird KOMPLETT gelöscht)" 1 "
 [[ -b $DISK ]] || die "$DISK ist kein Blockgerät."
 [[ $(lsblk -dno TYPE "$DISK") == disk ]] || die "$DISK ist keine ganze Platte."
 [[ $DISK != "$LIVE_DEV" ]] || die "$DISK ist das Installationsmedium."
-if lsblk -nro MOUNTPOINTS "$DISK" | grep -q .; then
-  die "Auf $DISK ist noch etwas eingehängt. Erst aushängen."
-fi
+# Nie die Platte des laufenden Systems anfassen
+for m in / /nix /nix/store /iso; do
+  src=$(findmnt -no SOURCE "$m" 2>/dev/null | sed 's/\[.*//' || true)
+  if [[ -b $src ]] && disk_devs "$DISK" | grep -qxF "$(realpath "$src")"; then
+    die "$DISK enthält $m des laufenden Systems."
+  fi
+done
 
 # ---------- Version ----------
 LATEST_REL=$(detect_latest_release)
@@ -282,7 +355,8 @@ cat <<EOF
 EOF
 echo
 warn "ALLE Daten auf $DISK werden gelöscht:"
-lsblk -po NAME,SIZE,FSTYPE,LABEL "$DISK"
+lsblk -po NAME,SIZE,TYPE,FSTYPE,LABEL,MOUNTPOINTS "$DISK"
+echo "Eingehängte Partitionen, Swap, LVM, RAID und LUKS auf $DISK werden vorher automatisch gelöst."
 read -rp "Zum Fortfahren den Gerätenamen ($DISK) erneut eingeben: " confirm
 [[ $confirm == "$DISK" ]] || die "Abgebrochen, nichts verändert."
 
@@ -290,21 +364,29 @@ read -rp "Zum Fortfahren den Gerätenamen ($DISK) erneut eingeben: " confirm
 #  Platte vorbereiten
 # =====================================================================
 
+info "Gebe $DISK frei"
+release_disk "$DISK"
+if lsblk -nro MOUNTPOINTS "$DISK" | grep -q . || [[ $(lsblk -lnpo NAME "$DISK" | grep -c /dev/mapper/ || true) -gt 0 ]]; then
+  lsblk -po NAME,TYPE,MOUNTPOINTS "$DISK" >&2
+  die "$DISK ist noch belegt und ließ sich nicht freigeben."
+fi
+
 info "Partitioniere $DISK"
 # alte Signaturen der Partitionen und der Platte entfernen
 while read -r part; do
   wipefs -af "$part" >/dev/null
 done < <(lsblk -lnpo NAME "$DISK" | tail -n +2)
 wipefs -af "$DISK" >/dev/null
+udevadm settle
 
-parted -s "$DISK" -- \
+if ! parted -s "$DISK" -- \
   mklabel gpt \
   mkpart ESP fat32 1MiB "${ESP_END_MIB}MiB" \
   set 1 esp on \
-  mkpart nixos btrfs "${ESP_END_MIB}MiB" 100%
-partprobe "$DISK" || true
-udevadm settle
-[[ -b $ESP && -b $ROOTPART ]] || die "Partitionen $ESP / $ROOTPART nicht gefunden."
+  mkpart nixos btrfs "${ESP_END_MIB}MiB" 100%; then
+  warn "parted meldet einen Fehler, lese die Partitionstabelle erneut ein."
+fi
+reread_partitions "$DISK"
 
 info "Formatiere ESP"
 mkfs.fat -F 32 -n boot "$ESP" >/dev/null
