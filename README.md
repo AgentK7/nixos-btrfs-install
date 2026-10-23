@@ -1,21 +1,34 @@
 # nixos-btrfs-install
 
-Interaktives Installer-Skript für NixOS 26.05 auf btrfs.
+Interaktives Installer-Skript für NixOS auf btrfs, wahlweise aktuelles Release oder unstable.
 
-Im NixOS-Live-System (UEFI) als root:
+Im NixOS-Live-System (UEFI, Secure Boot aus) als root:
 
 ```bash
-curl -L https://raw.githubusercontent.com/AgentK7/nixos-btrfs-install/main/install.sh -o i.sh && sudo bash i.sh
+curl -L is.gd/B1rzoc -o i.sh && sudo bash i.sh
 ```
+
+Langform: `https://raw.githubusercontent.com/AgentK7/nixos-btrfs-install/main/install.sh`
 
 ## Was es einrichtet
 
 - GPT: 1 GiB EFI-Partition (`/boot`), Rest btrfs, optional in LUKS2
 - Subvolumes `@`, `@home`, `@nix`, `@log`, `@swap` mit `compress=zstd,noatime`
-- systemd-boot, Swapfile, monatlicher btrfs-Scrub, Store-Optimierung
+- systemd-boot oder UKI über [lanzaboote](https://github.com/nix-community/lanzaboote) v1.2.0 mit erzeugten Secure-Boot-Schlüsseln
+- Swapfile, monatlicher btrfs-Scrub, Store-Optimierung
 - PipeWire mit ALSA (inkl. 32 bit), PulseAudio und JACK
-- Abfragen: Datenträger, Tastatur, Sprache, Desktop (GNOME, Plasma 6, COSMIC, Xfce, Cinnamon, keiner), Flatpak + Flathub, Unfree, Verschlüsselung, Auto-Updates, Shell (bash/zsh, optional oh-my-zsh)
+- Systempakete: git, nixfmt, pciutils, usbutils, smartmontools, btrfs-progs, compsize, htop, nom, nvd u. a.
+
+## Abfragen
+
+Datenträger, Version (Release/unstable), Tastatur, Sprache, Desktop (GNOME, Plasma 6, COSMIC, Xfce, Cinnamon, keiner), Flatpak + Flathub, Unfree, Verschlüsselung, UKI, Auto-Updates, Shell (bash/zsh, optional oh-my-zsh), Hostname, Benutzer, Swap.
 
 Alle Abfragen lassen sich per Umgebungsvariable vorbelegen, siehe Kopf von `install.sh`.
+
+## Secure Boot nach der Installation (nur mit UKI)
+
+1. `sudo sbctl verify`
+2. Im Firmware-Setup Secure Boot einschalten und in den Setup Mode setzen
+3. `sudo sbctl enroll-keys --microsoft`, neu starten, `bootctl status`
 
 **Achtung:** Die gewählte Platte wird komplett gelöscht.

@@ -1,16 +1,17 @@
 #!/usr/bin/env bash
-# NixOS 26.05 auf btrfs installieren
-#   UEFI + systemd-boot, ESP >= 1 GiB, Rest btrfs (optional in LUKS2)
+# NixOS (aktuelles Release oder unstable) auf btrfs installieren
+#   UEFI + systemd-boot oder UKI via lanzaboote, ESP >= 1 GiB, Rest btrfs (optional in LUKS2)
 #   Subvolumes @ @home @nix @log @swap, zstd, Swapfile, PipeWire (ALSA/32 bit, Pulse, JACK)
 #
 # Aufruf im NixOS-Live-System als root:
 #   bash nixos-btrfs-install.sh
 #
 # Jede Abfrage lässt sich per Umgebungsvariable vorbelegen, z. B.:
-#   DISK=/dev/nvme0n1 KB=de LOCALE=de_DE.UTF-8 DESKTOP=plasma FLATPAK=j UNFREE=j ENCRYPT=j \
-#   AUTOUPDATE=n LOGIN_SHELL=zsh OHMYZSH=j NIX_HOSTNAME=nixos NIX_USER=alice SWAP_GB=8 \
-#   bash nixos-btrfs-install.sh
+#   DISK=/dev/nvme0n1 CHANNEL=release KB=de LOCALE=de_DE.UTF-8 DESKTOP=plasma FLATPAK=j \
+#   UNFREE=j ENCRYPT=j UKI=n AUTOUPDATE=n LOGIN_SHELL=zsh OHMYZSH=j \
+#   NIX_HOSTNAME=nixos NIX_USER=alice SWAP_GB=8 bash nixos-btrfs-install.sh
 #
+#   CHANNEL     release (neuestes stabiles Release) | unstable
 #   KB          Tastatur als xkb-Layout[:Variante], z. B. de, de:nodeadkeys, us:intl
 #   LOCALE      z. B. de_DE.UTF-8 oder en_US.UTF-8+de_DE.UTF-8 (Sprache + Formate)
 #   DESKTOP     gnome | plasma | cosmic | xfce | cinnamon | none
@@ -76,13 +77,27 @@ emit() {
   printf '\n  # %s\n%s\n' "$1" "$2"
 }
 
+# Neuestes stabiles Release laut status.nixos.org, sonst die Version des Installers
+detect_latest_release() {
+  local json rel=""
+  json=$(curl -fsSL --max-time 10 'https://prometheus.nixos.org/api/v1/query?query=channel_revision' 2>/dev/null || true)
+  rel=$(grep -o '"metric":{[^}]*}' <<<"$json" | grep '"status":"stable"' \
+        | grep -o '"channel":"nixos-[0-9][0-9]\.[0-9][0-9]"' | grep -o '[0-9][0-9]\.[0-9][0-9]' \
+        | sort -V | tail -n1 || true)
+  [[ -n $rel ]] || rel=$(nixos-version 2>/dev/null | grep -oE '^[0-9]{2}\.[0-9]{2}' || true)
+  echo "$rel"
+}
+
 # ---------- Vorabprüfungen ----------
 [[ $EUID -eq 0 ]] || die "Bitte als root ausführen (sudo -i)."
 [[ -d /sys/firmware/efi ]] || die "Kein UEFI-Boot erkannt. Den USB-Stick im UEFI-Modus starten."
-for cmd in parted partprobe wipefs mkfs.fat mkfs.btrfs btrfs cryptsetup nixos-generate-config nixos-install nixos-enter udevadm; do
+for cmd in parted partprobe wipefs mkfs.fat mkfs.btrfs btrfs cryptsetup curl nix-channel nix-instantiate nix-shell nixos-generate-config nixos-install nixos-enter udevadm; do
   command -v "$cmd" >/dev/null || die "'$cmd' fehlt. Läuft das Skript im NixOS-Installer?"
 done
 ping -c1 -W3 cache.nixos.org >/dev/null 2>&1 || warn "Keine Verbindung zu cache.nixos.org. WLAN mit 'nmtui' einrichten."
+
+# Feste Suchpfade, damit <nixpkgs> auch bei "sudo bash" auf den root-Kanal zeigt
+export NIX_PATH="nixpkgs=/nix/var/nix/profiles/per-user/root/channels/nixos:/nix/var/nix/profiles/per-user/root/channels"
 
 # Reste eines abgebrochenen Laufs aufräumen
 if mountpoint -q /mnt; then umount -R /mnt; fi
@@ -121,6 +136,20 @@ choose DISK "Auf welchen Datenträger soll NixOS? (wird KOMPLETT gelöscht)" 1 "
 if lsblk -nro MOUNTPOINTS "$DISK" | grep -q .; then
   die "Auf $DISK ist noch etwas eingehängt. Erst aushängen."
 fi
+
+# ---------- Version ----------
+LATEST_REL=$(detect_latest_release)
+choose CHANNEL "Welche NixOS-Version?" 1 \
+  "release|Aktuelles Release ${LATEST_REL:-?} (stabil, empfohlen)" \
+  "unstable|Unstable (rollend, neueste Pakete)"
+case $CHANNEL in
+  release)
+    [[ -n $LATEST_REL ]] || die "Aktuelles Release nicht ermittelbar. Netzwerk prüfen."
+    CHANNEL_NAME="nixos-$LATEST_REL" ;;
+  unstable)
+    CHANNEL_NAME="nixos-unstable" ;;
+  *) die "Unbekannte Version: $CHANNEL (release oder unstable)" ;;
+esac
 
 # ---------- 2. Tastaturlayout ----------
 choose KB "Welches Tastaturlayout?" 1 \
@@ -196,6 +225,7 @@ else
 fi
 ask_yn UNFREE    "Unfreie Pakete erlauben (z. B. NVIDIA-Treiber, Steam)?" j
 ask_yn ENCRYPT    "Datenträger mit LUKS verschlüsseln?" n
+ask_yn UKI        "UKI (Unified Kernel Image) über lanzaboote? Bereitet Secure Boot vor" n
 ask_yn AUTOUPDATE "Automatische Updates (nachts, ohne Neustart)?" n
 
 choose LOGIN_SHELL "Welche Shell für den Benutzer?" 1 \
@@ -234,6 +264,8 @@ cat <<EOF
   Datenträger:    $DISK
     ${ESP}  ${ESP_GB} GiB FAT32 -> /boot
     ${ROOTPART}  Rest, $( if (( ENCRYPT )); then echo "LUKS2 -> btrfs"; else echo "btrfs"; fi ) ($COMPRESS)
+  Version:        $CHANNEL_NAME
+  Bootloader:     $( if (( UKI )); then echo "UKI via lanzaboote (Secure-Boot-Schlüssel werden erzeugt)"; else echo "systemd-boot"; fi )
   Tastatur:       $XKB_LAYOUT${XKB_VARIANT:+ ($XKB_VARIANT)}
   Sprache:        $LANG_LOCALE${FORMAT_LOCALE:+, Formate $FORMAT_LOCALE}
   Zeitzone:       $TIMEZONE
@@ -317,6 +349,13 @@ findmnt -R /mnt
 #  Konfiguration
 # =====================================================================
 
+info "Setze Paketquelle auf $CHANNEL_NAME"
+nix-channel --add "https://channels.nixos.org/$CHANNEL_NAME" nixos
+nix-channel --update nixos
+# Release der gewählten Quelle, z. B. 26.05 oder bei unstable 26.11
+TARGET_RELEASE=$(nix-instantiate --eval -E '(import <nixpkgs/lib>).trivial.release' 2>/dev/null | tr -d '"' || true)
+echo "  NixOS-Release: ${TARGET_RELEASE:-unbekannt}"
+
 info "Erzeuge Konfiguration"
 nixos-generate-config --root /mnt >/dev/null
 HW=/mnt/etc/nixos/hardware-configuration.nix
@@ -327,13 +366,43 @@ if (( ENCRYPT )) && ! grep -q 'luks.devices."cryptroot"' "$HW"; then
   warn "LUKS-Eintrag für cryptroot fehlt in hardware-configuration.nix – bitte vor der Installation prüfen."
 fi
 
-STATE_VERSION=$(grep -oP 'system\.stateVersion = "\K[0-9.]+' "$CFG" || echo "26.05")
+if [[ $TARGET_RELEASE =~ ^[0-9]{2}\.[0-9]{2}$ ]]; then
+  STATE_VERSION=$TARGET_RELEASE
+else
+  STATE_VERSION=$(grep -oP 'system\.stateVersion = "\K[0-9.]+' "$CFG" || echo "26.05")
+fi
 mv "$CFG" "$CFG.generated"
 
 # --- Bausteine ---
-BOOT_NIX='  boot.loader.systemd-boot.enable = true;
+if (( UKI )); then
+  HEADER_NIX='{ config, lib, pkgs, ... }:
+let
+  # lanzaboote v1.2.0 (nix-community): baut für jede Generation eine signierte UKI
+  lanzaboote = import (builtins.fetchTarball {
+    url = "https://github.com/nix-community/lanzaboote/archive/c1c5edd31802d181c8aa2c71588995d93425d650.tar.gz";
+    sha256 = "0syvqpi77ia1vd189658g53mqjgw7i39zym2r0g7asdjkrz0mgmj";
+  }) { inherit pkgs; };
+in
+{
+  imports = [
+    ./hardware-configuration.nix
+    lanzaboote.nixosModules.lanzaboote
+  ];'
+  BOOT_NIX='  boot.loader.systemd-boot.enable = lib.mkForce false;  # lanzaboote ersetzt systemd-boot
+  boot.loader.systemd-boot.configurationLimit = 10;     # gilt auch für lanzaboote
+  boot.loader.efi.canTouchEfiVariables = true;
+  boot.lanzaboote = {
+    enable = true;
+    pkiBundle = "/var/lib/sbctl";  # Secure-Boot-Schlüssel, vom Installer erzeugt
+  };'
+else
+  HEADER_NIX='{ config, lib, pkgs, ... }:
+{
+  imports = [ ./hardware-configuration.nix ];'
+  BOOT_NIX='  boot.loader.systemd-boot.enable = true;
   boot.loader.systemd-boot.configurationLimit = 10;  # ESP nicht volllaufen lassen
   boot.loader.efi.canTouchEfiVariables = true;'
+fi
 
 LUKS_NIX=""
 if (( ENCRYPT )); then
@@ -517,12 +586,18 @@ PKG_NIX='  environment.systemPackages = with pkgs; [
     rsync
     # NixOS-Helfer
     nix-output-monitor  # nom: lesbare Build-Ausgabe
-    nvd                 # Paketunterschiede zwischen Generationen
+    nvd                 # Paketunterschiede zwischen Generationen'
+if (( UKI )); then
+  PKG_NIX+='
+    # Secure Boot
+    sbctl               # Schlüssel prüfen und in die Firmware eintragen'
+fi
+PKG_NIX+='
   ];'
 
 {
-  printf '%s\n' '{ config, pkgs, ... }:' '{' '  imports = [ ./hardware-configuration.nix ];'
-  emit "Bootloader"                          "$BOOT_NIX"
+  printf '%s\n' "$HEADER_NIX"
+  emit "Bootloader"                         "$BOOT_NIX"
   emit "Verschlüsselung"                     "$LUKS_NIX"
   emit "btrfs-Mount-Optionen (ergänzen subvol=... aus hardware-configuration.nix)" "$FS_NIX"
   emit "Swap"                                "$SWAP_NIX"
@@ -551,7 +626,20 @@ if is_yes "${edit:-n}"; then "${EDITOR:-nano}" "$CFG"; fi
 #  Installation
 # =====================================================================
 
-info "Installiere NixOS (je nach Desktop und Leitung 10–30 Minuten)"
+if (( UKI )); then
+  info "Erzeuge Secure-Boot-Schlüssel für lanzaboote"
+  rm -rf /var/lib/sbctl
+  nix-shell -p sbctl --run "sbctl create-keys"
+  mkdir -p /mnt/var/lib
+  cp -a /var/lib/sbctl /mnt/var/lib/
+  [[ -f /mnt/var/lib/sbctl/keys/db/db.key ]] || die "Schlüssel fehlen unter /mnt/var/lib/sbctl."
+fi
+
+if (( UKI )); then
+  info "Installiere NixOS (lanzaboote wird aus dem Quellcode gebaut, rechne mit 20–40 Minuten)"
+else
+  info "Installiere NixOS (je nach Desktop und Leitung 10–30 Minuten)"
+fi
 nixos-install --no-root-passwd
 
 info "root-Passwort setzen"
@@ -561,6 +649,16 @@ info "Passwort für $NIX_USER setzen"
 until nixos-enter --root /mnt -c "passwd $NIX_USER"; do warn "Nochmal versuchen."; done
 
 info "Installation abgeschlossen."
+if (( UKI )); then
+  cat <<'EOF'
+  Secure Boot ist vorbereitet, aber noch nicht aktiv. Nach dem ersten Start:
+    1. sudo sbctl verify           -> UKIs unter /boot/EFI/Linux sind signiert
+    2. Im Firmware-Setup Secure Boot einschalten und in den "Setup Mode" setzen
+       (nicht "alle Schlüssel löschen")
+    3. sudo sbctl enroll-keys --microsoft
+    4. Neu starten, prüfen mit: bootctl status
+EOF
+fi
 read -rp "Jetzt aushängen und neu starten? [J/n] " rb
 if [[ ${rb,,} != n* ]]; then
   umount -R /mnt
