@@ -19,6 +19,7 @@ Langform: `https://raw.githubusercontent.com/AgentK7/nixos-btrfs-install/main/in
 - Grafik: Intel, AMD, NVIDIA (offene Module oder Treiber 580 für ältere Karten), NVIDIA-PRIME für Laptops, nouveau
 - Swapfile plus zram, monatlicher btrfs-Scrub, Store-Optimierung, fwupd
 - PipeWire mit ALSA (inkl. 32 bit), PulseAudio und JACK
+- Samba: Netzlaufwerke nutzen oder zusätzlich `~/Freigabe` freigeben (sichtbar in Windows, macOS und Linux)
 - Optional: Drucken (CUPS + Avahi), Bluetooth, Steam + Gamemode, SSH nur mit Schlüssel (eingefügt oder `gh:<GitHub-Name>`)
 - zsh mit fertiger `~/.zshrc`, optional oh-my-zsh
 - Systempakete: git, nixfmt, vim, btop, ripgrep, fd, bat, jq, tmux, ncdu, nvme-cli, inxi, dig, nmap, tcpdump, iperf3, nix-tree, nh, direnv u. a.
@@ -26,7 +27,7 @@ Langform: `https://raw.githubusercontent.com/AgentK7/nixos-btrfs-install/main/in
 
 ## Abfragen
 
-Datenträger, Version, Tastatur, Sprache, Desktop (GNOME, Plasma 6, COSMIC, Xfce, Cinnamon, keiner) minimal oder vollständig, Grafiktreiber, Drucken, Bluetooth, Steam, Flatpak + Flathub, Unfree, Verschlüsselung, UKI, TPM2, Silent Boot (Plymouth), Snapshots, Auto-Updates, Shell, SSH, Hostname, Benutzer, Swap.
+Datenträger, Version, Tastatur, Sprache, Desktop (GNOME, Plasma 6, COSMIC, Xfce, Cinnamon, keiner) minimal oder vollständig, Grafiktreiber, Drucken, Bluetooth, Steam, Samba, Flatpak + Flathub, Unfree, Verschlüsselung, UKI, TPM2, Silent Boot (Plymouth), Snapshots, Auto-Updates, Shell, SSH, Hostname, Benutzer, Swap.
 
 Alle Abfragen lassen sich per Umgebungsvariable vorbelegen, siehe Kopf von `install.sh`.
 

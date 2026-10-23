@@ -9,7 +9,7 @@
 # Jede Abfrage lässt sich per Umgebungsvariable vorbelegen, z. B.:
 #   DISK=/dev/nvme0n1 CHANNEL=release KB=de LOCALE=de_DE.UTF-8 DESKTOP=plasma DESKTOP_MODE=minimal \
 #   GPU=amd PRINTING=j BLUETOOTH=j STEAM=n FLATPAK=j UNFREE=j ENCRYPT=j UKI=n TPM2=n SILENT=j \
-#   SNAPPER=j AUTOUPDATE=n LOGIN_SHELL=zsh OHMYZSH=j SSHD=n \
+#   SNAPPER=j SAMBA=client AUTOUPDATE=n LOGIN_SHELL=zsh OHMYZSH=j SSHD=n \
 #   NIX_HOSTNAME=nixos NIX_USER=alice SWAP_GB=8 bash nixos-btrfs-install.sh
 #
 #   CHANNEL     release (neuestes stabiles Release) | unstable
@@ -18,6 +18,7 @@
 #   DESKTOP     gnome | plasma | cosmic | xfce | cinnamon | none
 #   DESKTOP_MODE minimal (Desktop, Terminal, Dateimanager, Editor) | full (alle Standard-Apps)
 #   GPU         intel | amd | nvidia | nvidia-prime | nouveau | generic
+#   SAMBA       none | client (Netzlaufwerke nutzen) | server (zusätzlich ~/Freigabe freigeben)
 #   LOGIN_SHELL bash | zsh
 #   SSH_KEYS    öffentlicher Schlüssel oder gh:<GitHub-Name>
 # Ohne Abfrage, nur per Variable: TIMEZONE (Europe/Berlin), ESP_GB (1), COMPRESS (zstd),
@@ -450,6 +451,14 @@ else
   PRINTING=0; BLUETOOTH=0; STEAM=0
 fi
 
+# ---------- Samba ----------
+if [[ $DESKTOP != none ]]; then sdef=2; else sdef=1; fi
+choose SAMBA "Samba (Windows- und NAS-Freigaben)?" "$sdef" \
+  "none|Nein" \
+  "client|Netzlaufwerke nutzen (Client)" \
+  "server|Netzlaufwerke nutzen und ~/Freigabe im Netz freigeben (Server)"
+case $SAMBA in none|client|server) ;; *) die "SAMBA muss none, client oder server sein." ;; esac
+
 # ---------- 5. Audio ----------
 echo
 echo "Audio: PipeWire mit ALSA (inkl. 32 bit), PulseAudio- und JACK-Unterstützung wird eingerichtet."
@@ -540,6 +549,7 @@ cat <<EOF
   Desktop:        $DESKTOP$(if [[ $DESKTOP != none ]]; then echo " ($DESKTOP_MODE)"; fi)
   Grafik:         $GPU$(if [[ $GPU == nvidia* ]]; then echo " (offene Module: $(yn "$NV_OPEN"))"; fi)
   Extras:         Drucken $(yn "$PRINTING"), Bluetooth $(yn "$BLUETOOTH"), Steam $(yn "$STEAM")
+  Samba:          $(case $SAMBA in none) echo nein ;; client) echo "Client (Netzlaufwerke nutzen)" ;; server) echo "Client + Freigabe ~/Freigabe" ;; esac)
   Audio:          PipeWire (ALSA + 32 bit, Pulse, JACK)
   Flatpak:        $(yn "$FLATPAK")$(if (( FLATPAK )); then echo " (Flathub)"; fi)
   Unfree:         $(yn "$UNFREE")
@@ -642,6 +652,11 @@ nix-channel --update nixos
 # Release der gewählten Quelle, z. B. 26.05 oder bei unstable 26.11
 TARGET_RELEASE=$(nix-instantiate --eval -E '(import <nixpkgs/lib>).trivial.release' 2>/dev/null | tr -d '"' || true)
 echo "  NixOS-Release: ${TARGET_RELEASE:-unbekannt}"
+# Avahi-Optionen wurden umbenannt; prüfen, welche Form die gewählte Quelle kennt
+AVAHI_SETTINGS=0
+if [[ $SAMBA == server ]] && [[ $(nix-instantiate --eval -E '(import <nixpkgs/nixos> { configuration = {}; }).options.services.avahi ? settings' 2>/dev/null) == true ]]; then
+  AVAHI_SETTINGS=1
+fi
 
 info "Erzeuge Konfiguration"
 nixos-generate-config --root /mnt >/dev/null
@@ -864,12 +879,7 @@ fi
 # Desktop-Extras
 EXTRAS_NIX=""
 if (( PRINTING )); then
-  EXTRAS_NIX+='  services.printing.enable = true;
-  services.avahi = {
-    enable = true;
-    nssmdns4 = true;      # Netzwerkdrucker automatisch finden
-    openFirewall = true;
-  };'
+  EXTRAS_NIX+='  services.printing.enable = true;'
 fi
 if [[ $DESKTOP != none ]]; then
   if [[ -n $EXTRAS_NIX ]]; then EXTRAS_NIX+=$'\n'; fi
@@ -890,6 +900,61 @@ if (( STEAM )); then
   EXTRAS_NIX+='
   programs.steam.enable = true;
   programs.gamemode.enable = true;  # Spiele mit "gamemoderun %command%" starten'
+fi
+
+# Avahi: Drucker, NAS und Rechner im Netz finden, Namen wie nas.local auflösen
+AVAHI_NIX=""
+if (( PRINTING )) || [[ $SAMBA != none ]]; then
+  AVAHI_NIX='  services.avahi = {
+    enable = true;
+    nssmdns4 = true;      # Namen wie drucker.local oder nas.local auflösen
+    openFirewall = true;'
+  if [[ $SAMBA == server ]] && (( AVAHI_SETTINGS )); then
+    AVAHI_NIX+='
+    settings.publish = {   # Samba-Freigabe für macOS und Linux sichtbar machen
+      disable-publishing = false;
+      disable-user-service-publishing = false;
+      publish-addresses = true;
+    };'
+  elif [[ $SAMBA == server ]]; then
+    AVAHI_NIX+='
+    publish = {
+      enable = true;
+      userServices = true;  # Samba-Freigabe für macOS und Linux sichtbar machen
+    };'
+  fi
+  AVAHI_NIX+='
+  };'
+fi
+
+# Samba: Client-Werkzeuge kommen in die Systempakete, der Server hier
+SAMBA_NIX=""
+if [[ $SAMBA == server ]]; then
+  SAMBA_NIX="  services.samba = {
+    enable = true;
+    openFirewall = true;
+    settings = {
+      global = {
+        workgroup = \"WORKGROUP\";
+        \"server string\" = \"$NIX_HOSTNAME\";
+        security = \"user\";
+        \"map to guest\" = \"never\";      # kein Gastzugang
+        \"server min protocol\" = \"SMB2_10\"; # kein SMB1
+      };
+      freigabe = {
+        path = \"/home/$NIX_USER/Freigabe\";
+        browseable = \"yes\";
+        \"read only\" = \"no\";
+        \"valid users\" = \"$NIX_USER\";   # Samba-Passwort: sudo smbpasswd -a $NIX_USER
+        \"create mask\" = \"0644\";
+        \"directory mask\" = \"0755\";
+      };
+    };
+  };
+  services.samba-wsdd = {
+    enable = true;        # in der Windows-Netzwerkumgebung sichtbar
+    openFirewall = true;
+  };"
 fi
 
 SSH_NIX=""
@@ -1094,6 +1159,12 @@ case $DESKTOP in
     PKG_NIX+='
     xclip               # Zwischenablage im Terminal' ;;
 esac
+if [[ $SAMBA != none ]]; then
+  PKG_NIX+='
+    # Samba-Client (im Dateimanager: smb://server/freigabe)
+    cifs-utils          # mount -t cifs
+    samba               # smbclient, nmblookup, smbpasswd'
+fi
 if (( SNAPPER )) && [[ $DESKTOP != none ]]; then
   PKG_NIX+='
     btrfs-assistant     # Snapshots grafisch verwalten'
@@ -1135,6 +1206,8 @@ PKG_NIX+='
   emit "Desktop"                             "$DESKTOP_NIX"
   emit "Grafik"                              "$GPU_NIX"
   emit "Drucken, Bluetooth, Spiele"          "$EXTRAS_NIX"
+  emit "Netzwerkdienste finden (mDNS)"       "$AVAHI_NIX"
+  emit "Samba-Freigabe"                      "$SAMBA_NIX"
   emit "Audio: PipeWire mit ALSA, Pulse und JACK" "$AUDIO_NIX"
   emit "Flatpak"                             "$FLATPAK_NIX"
   emit "Firmware"                            "$FWUPD_NIX"
@@ -1192,6 +1265,15 @@ if [[ $LOGIN_SHELL == zsh ]]; then
   nixos-enter --root /mnt -c "chown $NIX_USER:users /home/$NIX_USER/.zshrc && chmod 644 /home/$NIX_USER/.zshrc"
 fi
 
+if [[ $SAMBA == server ]]; then
+  info "Lege ~/Freigabe an und setze das Samba-Passwort für $NIX_USER"
+  nixos-enter --root /mnt -c "install -d -m 700 -o $NIX_USER -g users /home/$NIX_USER/Freigabe"
+  echo "  Das Samba-Passwort ist getrennt vom Login-Passwort, darf aber gleich sein."
+  if ! nixos-enter --root /mnt -c "mkdir -p /var/lib/samba/private /var/lock/samba /var/cache/samba /run/samba && smbpasswd -a $NIX_USER"; then
+    warn "Samba-Passwort nicht gesetzt. Nach dem Start: sudo smbpasswd -a $NIX_USER"
+  fi
+fi
+
 info "Installation abgeschlossen."
 if (( UKI )); then
   cat <<'EOF'
@@ -1212,6 +1294,9 @@ EOF
 fi
 if [[ $GPU == nvidia-prime ]]; then
   echo "  NVIDIA-GPU für ein Programm nutzen: nvidia-offload <programm>"
+fi
+if [[ $SAMBA == server ]]; then
+  echo "  Samba-Freigabe: Windows \\\\$NIX_HOSTNAME\\freigabe, macOS/Linux smb://$NIX_HOSTNAME/freigabe"
 fi
 install -m 600 "$LOG" /mnt/var/log/nixos-install.log
 echo "  Protokoll gespeichert unter /var/log/nixos-install.log"
