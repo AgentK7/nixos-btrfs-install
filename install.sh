@@ -8,7 +8,7 @@
 #
 # Jede Abfrage lässt sich per Umgebungsvariable vorbelegen, z. B.:
 #   DISK=/dev/nvme0n1 CHANNEL=release KB=de LOCALE=de_DE.UTF-8 DESKTOP=plasma FLATPAK=j \
-#   UNFREE=j ENCRYPT=j UKI=n AUTOUPDATE=n LOGIN_SHELL=zsh OHMYZSH=j \
+#   UNFREE=j ENCRYPT=j UKI=n SILENT=j AUTOUPDATE=n LOGIN_SHELL=zsh OHMYZSH=j \
 #   NIX_HOSTNAME=nixos NIX_USER=alice SWAP_GB=8 bash nixos-btrfs-install.sh
 #
 #   CHANNEL     release (neuestes stabiles Release) | unstable
@@ -299,6 +299,7 @@ fi
 ask_yn UNFREE    "Unfreie Pakete erlauben (z. B. NVIDIA-Treiber, Steam)?" j
 ask_yn ENCRYPT    "Datenträger mit LUKS verschlüsseln?" n
 ask_yn UKI        "UKI (Unified Kernel Image) über lanzaboote? Bereitet Secure Boot vor" n
+ask_yn SILENT     "Silent Boot (Plymouth-Startbildschirm, minimale Meldungen)?" j
 ask_yn AUTOUPDATE "Automatische Updates (nachts, ohne Neustart)?" n
 
 choose LOGIN_SHELL "Welche Shell für den Benutzer?" 1 \
@@ -339,6 +340,7 @@ cat <<EOF
     ${ROOTPART}  Rest, $( if (( ENCRYPT )); then echo "LUKS2 -> btrfs"; else echo "btrfs"; fi ) ($COMPRESS)
   Version:        $CHANNEL_NAME
   Bootloader:     $( if (( UKI )); then echo "UKI via lanzaboote (Secure-Boot-Schlüssel werden erzeugt)"; else echo "systemd-boot"; fi )
+  Silent Boot:    $(yn "$SILENT")$(if (( SILENT )); then echo " (Plymouth)"; fi)
   Tastatur:       $XKB_LAYOUT${XKB_VARIANT:+ ($XKB_VARIANT)}
   Sprache:        $LANG_LOCALE${FORMAT_LOCALE:+, Formate $FORMAT_LOCALE}
   Zeitzone:       $TIMEZONE
@@ -484,6 +486,19 @@ else
   BOOT_NIX='  boot.loader.systemd-boot.enable = true;
   boot.loader.systemd-boot.configurationLimit = 10;  # ESP nicht volllaufen lassen
   boot.loader.efi.canTouchEfiVariables = true;'
+fi
+
+SILENT_NIX=""
+if (( SILENT )); then
+  SILENT_NIX='  boot.plymouth.enable = true;   # Startbildschirm, fragt auch das LUKS-Passwort ab
+  boot.consoleLogLevel = 3;      # nur Fehler auf der Konsole
+  boot.initrd.verbose = false;
+  boot.kernelParams = [
+    "quiet"
+    "rd.systemd.show_status=auto"
+    "rd.udev.log_level=3"
+    "udev.log_level=3"
+  ];'
 fi
 
 LUKS_NIX=""
@@ -680,6 +695,7 @@ PKG_NIX+='
 {
   printf '%s\n' "$HEADER_NIX"
   emit "Bootloader"                         "$BOOT_NIX"
+  emit "Silent Boot"                        "$SILENT_NIX"
   emit "Verschlüsselung"                     "$LUKS_NIX"
   emit "btrfs-Mount-Optionen (ergänzen subvol=... aus hardware-configuration.nix)" "$FS_NIX"
   emit "Swap"                                "$SWAP_NIX"
