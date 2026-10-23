@@ -116,7 +116,7 @@ release_disk() {
     umount "$tgt" 2>/dev/null || umount -l "$tgt"
   done < <(findmnt -rno TARGET,SOURCE | while read -r tgt src; do
              src=${src%%\[*}
-             [[ -b $src ]] && on_disk "$src" && printf '%s\n' "$tgt"
+             if [[ -b $src ]] && on_disk "$src"; then printf '%s\n' "$tgt"; fi
            done | sort -r)
 
   # LVM-Volume-Groups auf der Platte deaktivieren
@@ -194,7 +194,7 @@ while read -r name size model; do
   [[ $name == /dev/zram* || $name == "$LIVE_DEV" ]] && continue
   DISK_OPTS+=("$name|$(printf '%-16s %8s  %s' "$name" "$size" "${model:-}")")
 done < <(lsblk -dpno NAME,SIZE,MODEL -e 7,11 | while read -r n rest; do
-  [[ $(lsblk -dno TYPE "$n") == disk ]] && echo "$n $rest"
+  if [[ $(lsblk -dno TYPE "$n") == disk ]]; then echo "$n $rest"; fi
 done)
 (( ${#DISK_OPTS[@]} > 0 )) || die "Keine passende Platte gefunden."
 
@@ -344,11 +344,11 @@ cat <<EOF
   Zeitzone:       $TIMEZONE
   Desktop:        $DESKTOP
   Audio:          PipeWire (ALSA + 32 bit, Pulse, JACK)
-  Flatpak:        $(yn "$FLATPAK")$( (( FLATPAK )) && echo " (Flathub)" )
+  Flatpak:        $(yn "$FLATPAK")$(if (( FLATPAK )); then echo " (Flathub)"; fi)
   Unfree:         $(yn "$UNFREE")
   Verschlüsselt:  $(yn "$ENCRYPT")
   Auto-Updates:   $(yn "$AUTOUPDATE")
-  Shell:          $LOGIN_SHELL$( [[ $LOGIN_SHELL == zsh ]] && echo " (oh-my-zsh: $(yn "$OHMYZSH"))" )
+  Shell:          $LOGIN_SHELL$(if [[ $LOGIN_SHELL == zsh ]]; then echo " (oh-my-zsh: $(yn "$OHMYZSH"))"; fi)
   Hostname:       $NIX_HOSTNAME
   Benutzer:       $NIX_USER
   Swap:           ${SWAP_GB} GiB
