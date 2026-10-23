@@ -21,7 +21,7 @@ Langform: `https://raw.githubusercontent.com/AgentK7/nixos-btrfs-install/main/in
 
 ## Abfragen
 
-Datenträger, Version (Release/unstable), Tastatur, Sprache, Desktop (GNOME, Plasma 6, COSMIC, Xfce, Cinnamon, keiner), Flatpak + Flathub, Unfree, Verschlüsselung, UKI, Silent Boot (Plymouth), Auto-Updates, Shell (bash/zsh, optional oh-my-zsh), Hostname, Benutzer, Swap.
+Datenträger, Version (Release/unstable), Tastatur, Sprache, Desktop (GNOME, Plasma 6, COSMIC, Xfce, Cinnamon, keiner), Flatpak + Flathub, Unfree, Verschlüsselung, UKI, Silent Boot (Plymouth), Auto-Updates, Shell (bash/zsh, optional oh-my-zsh mit fertiger `~/.zshrc`), Hostname, Benutzer, Swap.
 
 Alle Abfragen lassen sich per Umgebungsvariable vorbelegen, siehe Kopf von `install.sh`.
 

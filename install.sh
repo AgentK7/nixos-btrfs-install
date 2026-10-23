@@ -78,6 +78,56 @@ emit() {
   printf '\n  # %s\n%s\n' "$1" "$2"
 }
 
+# ~/.zshrc mit oh-my-zsh aus dem Nix-Store
+write_zshrc_ohmyzsh() {
+  cat <<'EOF'
+# ~/.zshrc – vom NixOS-Installer angelegt
+# oh-my-zsh kommt aus dem Nix-Store und wird mit "update" (nixos-rebuild) aktualisiert.
+# Theme und Plugins hier ändern, wirksam in jeder neuen Shell oder sofort mit: exec zsh
+
+export ZSH=/run/current-system/sw/share/oh-my-zsh
+ZSH_CUSTOM="$HOME/.oh-my-zsh-custom"     # eigene Themes und Plugins
+ZSH_CACHE_DIR="$HOME/.cache/oh-my-zsh"   # der Nix-Store ist schreibgeschützt
+ZSH_COMPDUMP="$ZSH_CACHE_DIR/.zcompdump"
+mkdir -p "$ZSH_CUSTOM" "$ZSH_CACHE_DIR"
+zstyle ':omz:update' mode disabled       # Updates kommen über NixOS
+
+# Theme, Auswahl: ls $ZSH/themes
+ZSH_THEME="robbyrussell"
+
+# Plugins, Auswahl: ls $ZSH/plugins
+plugins=(git sudo colored-man-pages)
+
+source "$ZSH/oh-my-zsh.sh"
+
+# Vorschläge aus dem Verlauf, Pfeil rechts übernimmt
+if [[ -r /run/current-system/sw/share/zsh/plugins/zsh-autosuggestions/zsh-autosuggestions.zsh ]]; then
+  source /run/current-system/sw/share/zsh/plugins/zsh-autosuggestions/zsh-autosuggestions.zsh
+fi
+
+# Eigene Aliase
+alias rebuild='sudo nixos-rebuild switch'
+alias update='sudo nixos-rebuild switch --upgrade'
+
+# Syntax-Hervorhebung, muss als Letztes geladen werden
+if [[ -r /run/current-system/sw/share/zsh-syntax-highlighting/zsh-syntax-highlighting.zsh ]]; then
+  source /run/current-system/sw/share/zsh-syntax-highlighting/zsh-syntax-highlighting.zsh
+fi
+EOF
+}
+
+# ~/.zshrc ohne oh-my-zsh: Grundeinstellungen kommen aus /etc/zshrc
+write_zshrc_plain() {
+  cat <<'EOF'
+# ~/.zshrc – vom NixOS-Installer angelegt
+# Verlauf, Vervollständigung, Vorschläge und Syntax-Hervorhebung richtet NixOS
+# über programs.zsh in /etc/nixos/configuration.nix ein. Eigenes hier ergänzen.
+
+alias rebuild='sudo nixos-rebuild switch'
+alias update='sudo nixos-rebuild switch --upgrade'
+EOF
+}
+
 # Neuestes stabiles Release laut status.nixos.org, sonst die Version des Installers
 detect_latest_release() {
   local json rel=""
@@ -631,20 +681,22 @@ USER_SHELL=""
 if [[ $LOGIN_SHELL == zsh ]]; then
   USER_SHELL='
     shell = pkgs.zsh;'
-  SHELL_NIX='  programs.zsh = {
+  if (( OHMYZSH )); then
+    # oh-my-zsh wird in ~/.zshrc geladen (vom Installer angelegt), nicht in /etc/zshrc
+    SHELL_NIX='  programs.zsh = {
+    enable = true;
+    enableGlobalCompInit = false;  # compinit übernimmt oh-my-zsh in ~/.zshrc
+    promptInit = "";               # Prompt kommt vom oh-my-zsh-Theme
+  };
+  # feste Pfade für ~/.zshrc: /run/current-system/sw/share/...
+  environment.pathsToLink = [ "/share/oh-my-zsh" "/share/zsh-syntax-highlighting" ];'
+  else
+    SHELL_NIX='  programs.zsh = {
     enable = true;
     autosuggestions.enable = true;
-    syntaxHighlighting.enable = true;'
-  if (( OHMYZSH )); then
-    SHELL_NIX+='
-    ohMyZsh = {
-      enable = true;
-      theme = "robbyrussell";
-      plugins = [ "git" "sudo" ];
-    };'
-  fi
-  SHELL_NIX+='
+    syntaxHighlighting.enable = true;
   };'
+  fi
 fi
 
 USER_NIX="  users.users.\"$NIX_USER\" = {
@@ -695,6 +747,13 @@ PKG_NIX='  environment.systemPackages = with pkgs; [
     # NixOS-Helfer
     nix-output-monitor  # nom: lesbare Build-Ausgabe
     nvd                 # Paketunterschiede zwischen Generationen'
+if [[ $LOGIN_SHELL == zsh ]] && (( OHMYZSH )); then
+  PKG_NIX+='
+    # zsh: oh-my-zsh und Plugins, geladen in ~/.zshrc
+    oh-my-zsh
+    zsh-autosuggestions
+    zsh-syntax-highlighting'
+fi
 if (( UKI )); then
   PKG_NIX+='
     # Secure Boot
@@ -757,6 +816,18 @@ until nixos-enter --root /mnt -c 'passwd root'; do warn "Nochmal versuchen."; do
 
 info "Passwort für $NIX_USER setzen"
 until nixos-enter --root /mnt -c "passwd $NIX_USER"; do warn "Nochmal versuchen."; done
+
+if [[ $LOGIN_SHELL == zsh ]]; then
+  info "Lege ~/.zshrc für $NIX_USER an"
+  # Ohne ~/.zshrc startet zsh beim ersten Login den Einrichtungsassistenten
+  nixos-enter --root /mnt -c "install -d -m 700 -o $NIX_USER -g users /home/$NIX_USER"
+  if (( OHMYZSH )); then
+    write_zshrc_ohmyzsh > "/mnt/home/$NIX_USER/.zshrc"
+  else
+    write_zshrc_plain > "/mnt/home/$NIX_USER/.zshrc"
+  fi
+  nixos-enter --root /mnt -c "chown $NIX_USER:users /home/$NIX_USER/.zshrc && chmod 644 /home/$NIX_USER/.zshrc"
+fi
 
 info "Installation abgeschlossen."
 if (( UKI )); then
