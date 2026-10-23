@@ -15,7 +15,7 @@ Langform: `https://raw.githubusercontent.com/AgentK7/nixos-btrfs-install/main/in
 - GPT: 1 GiB EFI-Partition (`/boot`), Rest btrfs, optional in LUKS2
 - Subvolumes `@`, `@home`, `@nix`, `@log`, `@swap` mit `compress=zstd,noatime`
 - systemd-boot oder UKI über [lanzaboote](https://github.com/nix-community/lanzaboote) v1.2.0 mit erzeugten Secure-Boot-Schlüsseln
-- Swapfile, monatlicher btrfs-Scrub, Store-Optimierung
+- Neuester stabiler Kernel (`KERNEL=lts` für den Standard-Kernel), Swapfile, monatlicher btrfs-Scrub, Store-Optimierung
 - PipeWire mit ALSA (inkl. 32 bit), PulseAudio und JACK
 - Systempakete: git, nixfmt, pciutils, usbutils, smartmontools, btrfs-progs, compsize, htop, nom, nvd u. a.
 

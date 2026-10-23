@@ -16,7 +16,8 @@
 #   LOCALE      z. B. de_DE.UTF-8 oder en_US.UTF-8+de_DE.UTF-8 (Sprache + Formate)
 #   DESKTOP     gnome | plasma | cosmic | xfce | cinnamon | none
 #   LOGIN_SHELL bash | zsh
-# Ohne Abfrage, nur per Variable: TIMEZONE (Europe/Berlin), ESP_GB (1), COMPRESS (zstd)
+# Ohne Abfrage, nur per Variable: TIMEZONE (Europe/Berlin), ESP_GB (1), COMPRESS (zstd),
+#   KERNEL (latest = neuester stabiler Kernel | lts = Standard-Kernel des Releases)
 
 set -Eeuo pipefail
 
@@ -175,6 +176,12 @@ if [[ -e /dev/mapper/cryptroot ]]; then cryptsetup close cryptroot; fi
 : "${TIMEZONE:=Europe/Berlin}"
 : "${ESP_GB:=1}"
 : "${COMPRESS:=zstd}"
+: "${KERNEL:=latest}"
+case $KERNEL in
+  latest) KERNEL_ATTR=linuxPackages_latest ;;
+  lts)    KERNEL_ATTR=linuxPackages ;;
+  *)      die "KERNEL muss latest oder lts sein." ;;
+esac
 [[ $ESP_GB =~ ^[0-9]+$ ]] && (( ESP_GB >= 1 )) || die "ESP_GB muss mindestens 1 sein."
 
 # =====================================================================
@@ -340,6 +347,7 @@ cat <<EOF
     ${ROOTPART}  Rest, $( if (( ENCRYPT )); then echo "LUKS2 -> btrfs"; else echo "btrfs"; fi ) ($COMPRESS)
   Version:        $CHANNEL_NAME
   Bootloader:     $( if (( UKI )); then echo "UKI via lanzaboote (Secure-Boot-Schlüssel werden erzeugt)"; else echo "systemd-boot"; fi )
+  Kernel:         $(if [[ $KERNEL == latest ]]; then echo "neuester stabiler (linuxPackages_latest)"; else echo "Standard des Releases (linuxPackages)"; fi)
   Silent Boot:    $(yn "$SILENT")$(if (( SILENT )); then echo " (Plymouth)"; fi)
   Tastatur:       $XKB_LAYOUT${XKB_VARIANT:+ ($XKB_VARIANT)}
   Sprache:        $LANG_LOCALE${FORMAT_LOCALE:+, Formate $FORMAT_LOCALE}
@@ -487,6 +495,9 @@ else
   boot.loader.systemd-boot.configurationLimit = 10;  # ESP nicht volllaufen lassen
   boot.loader.efi.canTouchEfiVariables = true;'
 fi
+
+KERNEL_NIX="  boot.kernelPackages = pkgs.$KERNEL_ATTR;"
+if [[ $KERNEL == latest ]]; then KERNEL_NIX+="  # neuester stabiler Kernel"; fi
 
 SILENT_NIX=""
 if (( SILENT )); then
@@ -695,6 +706,7 @@ PKG_NIX+='
 {
   printf '%s\n' "$HEADER_NIX"
   emit "Bootloader"                         "$BOOT_NIX"
+  emit "Kernel"                             "$KERNEL_NIX"
   emit "Silent Boot"                        "$SILENT_NIX"
   emit "Verschlüsselung"                     "$LUKS_NIX"
   emit "btrfs-Mount-Optionen (ergänzen subvol=... aus hardware-configuration.nix)" "$FS_NIX"
