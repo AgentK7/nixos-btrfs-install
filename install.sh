@@ -15,6 +15,7 @@
 #   KB          Tastatur als xkb-Layout[:Variante], z. B. de, de:nodeadkeys, us:intl
 #   LOCALE      z. B. de_DE.UTF-8 oder en_US.UTF-8+de_DE.UTF-8 (Sprache + Formate)
 #   DESKTOP     gnome | plasma | cosmic | xfce | cinnamon | none
+#   DESKTOP_MODE minimal (Desktop, Terminal, Dateimanager, Editor) | full (alle Standard-Apps)
 #   LOGIN_SHELL bash | zsh
 # Ohne Abfrage, nur per Variable: TIMEZONE (Europe/Berlin), ESP_GB (1), COMPRESS (zstd),
 #   KERNEL (latest = neuester stabiler Kernel | lts = Standard-Kernel des Releases)
@@ -341,6 +342,14 @@ choose DESKTOP "Welche Desktop-Umgebung?" 2 \
   "cinnamon|Cinnamon" \
   "none|Keine (nur Konsole, z. B. Server)"
 case $DESKTOP in gnome|plasma|cosmic|xfce|cinnamon|none) ;; *) die "Unbekannter Desktop: $DESKTOP" ;; esac
+if [[ $DESKTOP != none ]]; then
+  choose DESKTOP_MODE "Umfang der Desktop-Installation?" 1 \
+    "minimal|Minimal: Desktop, Terminal, Dateimanager, Editor, Firefox (empfohlen)" \
+    "full|Vollständig: alle Standard-Apps des Desktops"
+  case $DESKTOP_MODE in minimal|full) ;; *) die "DESKTOP_MODE muss minimal oder full sein." ;; esac
+else
+  DESKTOP_MODE=none
+fi
 
 # ---------- 5. Audio ----------
 echo
@@ -402,7 +411,7 @@ cat <<EOF
   Tastatur:       $XKB_LAYOUT${XKB_VARIANT:+ ($XKB_VARIANT)}
   Sprache:        $LANG_LOCALE${FORMAT_LOCALE:+, Formate $FORMAT_LOCALE}
   Zeitzone:       $TIMEZONE
-  Desktop:        $DESKTOP
+  Desktop:        $DESKTOP$(if [[ $DESKTOP != none ]]; then echo " ($DESKTOP_MODE)"; fi)
   Audio:          PipeWire (ALSA + 32 bit, Pulse, JACK)
   Flatpak:        $(yn "$FLATPAK")$(if (( FLATPAK )); then echo " (Flathub)"; fi)
   Unfree:         $(yn "$UNFREE")
@@ -642,6 +651,46 @@ if [[ $DESKTOP != none ]]; then
   programs.firefox.enable = true;"
 fi
 
+# Minimal: Standard-Apps weglassen, Terminal, Dateimanager und Editor bleiben
+DESKTOP_PKGS=""
+if [[ $DESKTOP_MODE == minimal ]]; then
+  case $DESKTOP in
+    gnome)
+      DESKTOP_NIX+='
+  # Minimal: keine GNOME-Standard-Apps, nur das Nötigste unten in den Systempaketen
+  services.gnome.core-apps.enable = false;
+  environment.gnome.excludePackages = with pkgs; [ gnome-tour gnome-user-docs ];'
+      DESKTOP_PKGS='
+    # GNOME minimal
+    gnome-console
+    nautilus
+    gnome-text-editor
+    gnome-system-monitor' ;;
+    plasma)
+      DESKTOP_NIX+='
+  # Minimal: Konsole, Dolphin, Ark, Spectacle und Discover bleiben
+  environment.plasma6.excludePackages = with pkgs.kdePackages; [
+    elisa gwenview okular kate khelpcenter krdp
+  ];' ;;
+    cosmic)
+      DESKTOP_NIX+='
+  # Minimal: Terminal, Dateien, Editor und Store bleiben
+  environment.cosmic.excludePackages = with pkgs; [ cosmic-player cosmic-reader ];' ;;
+    xfce)
+      DESKTOP_NIX+='
+  # Minimal: Terminal, Thunar und Mousepad bleiben
+  environment.xfce.excludePackages = with pkgs; [ parole ristretto ];' ;;
+    cinnamon)
+      DESKTOP_NIX+='
+  # Minimal: keine Mint-Apps, Nemo ist Teil des Desktops
+  services.cinnamon.apps.enable = false;
+  programs.gnome-terminal.enable = true;'
+      DESKTOP_PKGS='
+    # Cinnamon minimal
+    xed-editor' ;;
+  esac
+fi
+
 AUDIO_NIX='  services.pulseaudio.enable = false;
   security.rtkit.enable = true;
   services.pipewire = {
@@ -722,6 +771,8 @@ if (( FLATPAK )); then
   };'
 fi
 
+FWUPD_NIX='  services.fwupd.enable = true;  # Firmware-Updates: fwupdmgr refresh && fwupdmgr update'
+
 NIXSET_NIX='  nix.settings.auto-optimise-store = true;  # identische Dateien im Store per Hardlink zusammenlegen'
 
 PKG_NIX='  environment.systemPackages = with pkgs; [
@@ -759,6 +810,7 @@ if (( UKI )); then
     # Secure Boot
     sbctl               # Schlüssel prüfen und in die Firmware eintragen'
 fi
+PKG_NIX+="$DESKTOP_PKGS"
 PKG_NIX+='
   ];'
 
@@ -777,6 +829,7 @@ PKG_NIX+='
   emit "Desktop"                             "$DESKTOP_NIX"
   emit "Audio: PipeWire mit ALSA, Pulse und JACK" "$AUDIO_NIX"
   emit "Flatpak"                             "$FLATPAK_NIX"
+  emit "Firmware"                            "$FWUPD_NIX"
   emit "Nix"                                 "$NIXSET_NIX"
   emit "Unfreie Pakete"                      "$UNFREE_NIX"
   emit "Automatische Updates"                "$UPDATE_NIX"

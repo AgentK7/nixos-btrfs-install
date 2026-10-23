@@ -17,11 +17,12 @@ Langform: `https://raw.githubusercontent.com/AgentK7/nixos-btrfs-install/main/in
 - systemd-boot oder UKI über [lanzaboote](https://github.com/nix-community/lanzaboote) v1.2.0 mit erzeugten Secure-Boot-Schlüsseln
 - Neuester stabiler Kernel (`KERNEL=lts` für den Standard-Kernel), Swapfile, monatlicher btrfs-Scrub, Store-Optimierung
 - PipeWire mit ALSA (inkl. 32 bit), PulseAudio und JACK
+- fwupd für Firmware-Updates
 - Systempakete: git, nixfmt, pciutils, usbutils, smartmontools, btrfs-progs, compsize, htop, nom, nvd u. a.
 
 ## Abfragen
 
-Datenträger, Version (Release/unstable), Tastatur, Sprache, Desktop (GNOME, Plasma 6, COSMIC, Xfce, Cinnamon, keiner), Flatpak + Flathub, Unfree, Verschlüsselung, UKI, Silent Boot (Plymouth), Auto-Updates, Shell (bash/zsh, optional oh-my-zsh mit fertiger `~/.zshrc`), Hostname, Benutzer, Swap.
+Datenträger, Version (Release/unstable), Tastatur, Sprache, Desktop (GNOME, Plasma 6, COSMIC, Xfce, Cinnamon, keiner) minimal oder vollständig, Flatpak + Flathub, Unfree, Verschlüsselung, UKI, Silent Boot (Plymouth), Auto-Updates, Shell (bash/zsh, optional oh-my-zsh mit fertiger `~/.zshrc`), Hostname, Benutzer, Swap.
 
 Alle Abfragen lassen sich per Umgebungsvariable vorbelegen, siehe Kopf von `install.sh`.
 
