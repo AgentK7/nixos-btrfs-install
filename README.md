@@ -15,6 +15,8 @@ Langform: `https://raw.githubusercontent.com/AgentK7/nixos-btrfs-install/main/in
 Fragen erscheinen als Menüs mit Pfeiltasten und Checklisten (`dialog`). Mit `TUI=n` gibt es reine Textabfragen,
 ohne Terminal (z. B. über eine Pipe) schaltet das Skript automatisch darauf um.
 
+Die erste Frage ist **„Erweiterte Optionen anzeigen?“** (Standard: nein). Nur dort gibt es Dual-Boot und die zweite Platte.
+
 ## Sicherheit beim Installieren
 
 - Die erzeugte Konfiguration wird **vor** dem Löschen gegen die gewählte NixOS-Version geprüft. Ist sie fehlerhaft, bricht das Skript ab, ohne etwas anzufassen.
@@ -31,7 +33,49 @@ DISK=/dev/nvme0n1 ANTWORTEN=/pfad/install-antworten.env sudo -E bash i.sh
 ANTWORTEN=https://server/install-antworten.env sudo -E bash i.sh
 ```
 
-Die Datei wird nur gelesen, nicht ausgeführt. Hostname, Grafik und Swap-Größe ggf. pro Rechner anpassen.
+Die Datei wird nur gelesen, nicht ausgeführt. Hostname, Grafik, Swap-Größe und feste IP ggf. pro Rechner anpassen.
+
+### Vollautomatisch
+
+Mit `AUTO=j` stellt das Skript keine einzige Frage: Was nicht vorgegeben ist, bekommt den Vorschlag des Skripts.
+Pflicht sind `DISK`, `NIX_USER` und als Schutz vor Tippfehlern `CONFIRM_DISK` (gleicher Wert wie `DISK`).
+Passwörter kommen aus einer eigenen Datei, die nirgends gespeichert oder protokolliert wird:
+
+```bash
+AUTO=j DISK=/dev/nvme0n1 CONFIRM_DISK=/dev/nvme0n1 NIX_USER=alice \
+  ANTWORTEN=antworten.env PASSWORT_DATEI=/root/geheim.env sudo -E bash i.sh
+```
+
+```bash
+# geheim.env (chmod 600)
+LUKS_PASS='…'          # nur mit Verschlüsselung
+USER_HASH='$y$j9T$…'   # oder USER_PASS='…'; Hash erzeugen mit: mkpasswd -m yescrypt
+ROOT_HASH='…'          # optional, ohne bleibt root gesperrt (sudo reicht)
+EXTRA_PASS='…'         # Startpasswort weiterer Benutzer, muss beim ersten Anmelden geändert werden
+SAMBA_PASS='…'  BACKUP_PASS='…'  TS_AUTHKEY='tskey-…'
+```
+
+Fehlt etwas Nötiges, bricht das Skript ab, **bevor** etwas gelöscht wird. Am Ende startet es neu (`REBOOT=n` verhindert das).
+
+## Netzwerk
+
+- **WLAN übernehmen:** Ist im Live-System ein WLAN verbunden, kopiert das Skript die Verbindung ins neue System – es ist nach dem ersten Start sofort online.
+- **Server (ohne Desktop):** DHCP oder feste IP (IPv4, optional IPv6) über systemd-networkd; Vorschläge kommen aus der aktuellen Verbindung.
+- **VPN:** Tailscale (mit Auth-Key meldet es sich beim ersten Start selbst an) oder WireGuard (vorhandene `wg0.conf` als Pfad oder https-URL, `ListenPort` wird in der Firewall geöffnet).
+- **fail2ban** für SSH, wenn SSH eingerichtet wird.
+
+## Erweiterte Optionen
+
+**Dual-Boot** (nur UEFI, GPT): NixOS kommt in den größten freien Bereich, vorhandene Partitionen bleiben unangetastet.
+Vorher im anderen System Platz freigeben (Windows: Datenträgerverwaltung → Volume verkleinern, mindestens 20 GiB).
+- Vorhandene EFI-Partition wird mitbenutzt; systemd-boot zeigt Windows im Bootmenü.
+- Ist sie kleiner als 1 GiB (Windows legt meist 100 MiB an), bekommt NixOS eine eigene 1-GiB-Boot-Partition (XBOOTLDR) für Kernel und initrd. UKI gibt es dann nicht.
+- Windows erkannt: Hardware-Uhr auf Ortszeit. In Windows vorher Schnellstart ausschalten und den BitLocker-Wiederherstellungsschlüssel bereithalten.
+
+**Zweite Platte:**
+- *RAID1:* btrfs-Spiegel über beide Platten (Daten und Metadaten), mit Verschlüsselung beide in LUKS (ein Passwort). Kein Swapfile, nur zram.
+- *Datenplatte:* neu formatiert, btrfs unter `/data` (`nofail`, startet auch ohne die Platte).
+- *Vorhandene Daten:* eine Partition (ext4, btrfs, xfs, NTFS, exFAT, FAT) bleibt erhalten und wird unter `/data` eingehängt.
 
 ## Was es einrichtet
 
@@ -77,4 +121,4 @@ Kernel dann im Original neu.
 - Zweiten YubiKey als Ersatz für sudo: `pamu2fcfg -n -o pam://<hostname> -i pam://<hostname> >> ~/.config/Yubico/u2f_keys`
 - Kanäle (nixos, home-manager, nixos-hardware) aktualisieren: `sudo nix-channel --update`, dann `sudo nixos-rebuild switch`
 
-**Achtung:** Die gewählte Platte wird komplett gelöscht.
+**Achtung:** Ohne Dual-Boot wird die gewählte Platte komplett gelöscht.

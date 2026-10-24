@@ -15,6 +15,15 @@
 #   ANTWORTEN=/pfad/install-antworten.env bash nixos-btrfs-install.sh
 #   ANTWORTEN=https://server/install-antworten.env bash nixos-btrfs-install.sh
 #
+# Vollautomatisch, ohne jede Rückfrage (fehlende Antworten = Vorschlag des Skripts):
+#   AUTO=j DISK=/dev/nvme0n1 CONFIRM_DISK=/dev/nvme0n1 NIX_USER=alice \
+#   ANTWORTEN=antworten.env PASSWORT_DATEI=/pfad/geheim.env bash nixos-btrfs-install.sh
+# Die Passwortdatei hat dieselbe Form NAME='wert' und wird nirgends gespeichert:
+#   LUKS_PASS  Verschlüsselung        USER_PASS / USER_HASH    Hauptbenutzer
+#   ROOT_PASS / ROOT_HASH (ohne: root gesperrt)                EXTRA_PASS / EXTRA_HASH  weitere Benutzer
+#   SAMBA_PASS  BACKUP_PASS  TS_AUTHKEY (Tailscale)            *_HASH z. B. von: mkpasswd -m yescrypt
+# Wird eine zweite Platte gelöscht (RAID1, Datenplatte), zusätzlich CONFIRM_DISK2. Neustart am Ende: REBOOT=j|n.
+#
 #   CHANNEL      release (neuestes stabiles Release) | unstable
 #   KB           Tastatur als xkb-Layout[:Variante], z. B. de, de:nodeadkeys, us:intl
 #   LOCALE       z. B. de_DE.UTF-8 oder en_US.UTF-8+de_DE.UTF-8 (Sprache + Formate)
@@ -27,6 +36,10 @@
 #   BACKUP_REPO  restic-Ziel, z. B. sftp:benutzer@nas:/backup/rechner
 #   LID          suspend | hibernate (Standby, nach 1 h Ruhezustand) | ignore
 #   HW_PROFILE   nixos-hardware-Profil, z. B. lenovo/thinkpad/t480, oder none
+#   INSTALL_MODE wipe (ganze Platte) | dualboot (in freien Platz, nur UEFI)
+#   DISK2, DISK2_MODE  zweite Platte: none | raid1 | data (neu) | keep (vorhandene Daten); DATA_PART bei keep
+#   NET_MODE     dhcp | static (ohne Desktop), dazu NET_IF NET_ADDR NET_GW NET_DNS [NET_ADDR6 NET_GW6]
+#   VPN          none | tailscale | wireguard (WG_CONF = Pfad oder URL zur wg0.conf)
 #   LOGIN_SHELL  bash | zsh
 #   SSH_KEYS     öffentlicher Schlüssel oder gh:<GitHub-Name>
 #   GIT_NAME, GIT_EMAIL  Git-Identität (nur mit home-manager)
@@ -34,11 +47,12 @@
 #   NIX_HOSTNAME, NIX_USER, SWAP_GB
 #   Ja/Nein (j/n): PRINTING BLUETOOTH STEAM LIBVIRT FLATPAK UNFREE ENCRYPT UKI TPM2 SILENT
 #                  SNAPPER BACKUP HIBERNATE AUTOUPDATE OHMYZSH SSHD NV_OPEN FINGERPRINT
-#                  FIDO2_LUKS FIDO2_SUDO RESCUE HOME_MANAGER
+#                  FIDO2_LUKS FIDO2_SUDO RESCUE HOME_MANAGER FAIL2BAN WIFI_COPY ADVANCED
 # Ohne Abfrage, nur per Variable: ESP_GB (Größe von /boot in GiB, 1), COMPRESS (zstd), ZRAM (j),
 #   BOOT_MODE (uefi | bios; Standard: wie der USB-Stick gestartet wurde),
 #   KERNEL (latest = neuester stabiler Kernel | lts = Standard-Kernel des Releases),
-#   TUI (j = Menüs mit dialog, n = reine Textabfragen)
+#   TUI (j = Menüs mit dialog, n = reine Textabfragen),
+#   DB_MIN_GB (Dual-Boot: mindestens so viel freier Platz in GiB, 20)
 #
 # Das komplette Protokoll landet in /var/log/nixos-install.log des neuen Systems.
 
@@ -62,7 +76,7 @@ is_yes() { [[ ${1,,} =~ ^(j|ja|y|yes|1)$ ]]; }
 yn() { if (( $1 )); then echo ja; else echo nein; fi; }
 
 # ---------- Oberfläche: dialog-Menüs, sonst Textabfragen ----------
-USE_DIALOG=0; DIALOG_BIN=""; WIPED=0
+USE_DIALOG=0; DIALOG_BIN=""; WIPED=0; AUTO_MODE=0
 USB_DIR=${USB_DIR:-/sys/bus/usb/devices}
 
 # dialog zeichnet auf dem Terminal, das Ergebnis kommt über fd 3 zurück
@@ -98,6 +112,12 @@ ask() {
     if [[ -n $re && ! ${!var} =~ $re ]]; then die "$var: $msg (${!var})"; fi
     return 0
   fi
+  if (( AUTO_MODE )); then
+    if [[ -n $re && ! $def =~ $re ]]; then die "Automatikmodus: $var muss gesetzt sein ($prompt)."; fi
+    printf -v "$var" '%s' "$def"
+    echo "  $prompt: $def (automatisch)"
+    return 0
+  fi
   while true; do
     if (( USE_DIALOG )); then
       val=$(dlg --title "Eingabe" --inputbox "$prompt" 0 0 "$def") || dlg_abort
@@ -117,6 +137,10 @@ ask() {
 ask_yn() {
   local var=$1 prompt=$2 def=$3 val hint rc
   val=${!var-}
+  if [[ -z $val ]] && (( AUTO_MODE )); then
+    val=$def
+    echo "  $prompt -> $(if [[ $val == j ]]; then echo ja; else echo nein; fi) (automatisch)"
+  fi
   if [[ -z $val ]]; then
     if (( USE_DIALOG )); then
       rc=0
@@ -150,6 +174,13 @@ ask_multi() {
     fi
   done
   if (( ${#open[@]} == 0 )); then return 0; fi
+  if (( AUTO_MODE )); then
+    for i in "${open[@]}"; do
+      if [[ ${args[i+2]} == j ]]; then printf -v "${args[i]}" 1; else printf -v "${args[i]}" 0; fi
+      echo "  ${args[i+1]}: $(yn "${!args[i]}") (automatisch)"
+    done
+    return 0
+  fi
   if (( USE_DIALOG )); then
     for i in "${open[@]}"; do
       if [[ ${args[i+2]} == j ]]; then st=on; else st=off; fi
@@ -171,6 +202,8 @@ ask_multi() {
 # ask_pass VAR "Frage" – Passwort zweimal ohne Echo; landet nicht im Protokoll
 ask_pass() {
   local var=$1 prompt=$2 p1 p2
+  if [[ -n ${!var-} ]]; then return 0; fi   # z. B. aus der Passwortdatei
+  if (( AUTO_MODE )); then die "Automatikmodus: $var fehlt in der Passwortdatei (PASSWORT_DATEI)."; fi
   while true; do
     if (( USE_DIALOG )); then
       p1=$(dlg --insecure --passwordbox "$prompt" 0 0) || dlg_abort
@@ -192,6 +225,11 @@ choose() {
   shift 3
   local opts=("$@") items=()
   [[ -n ${!var-} ]] && return 0
+  if (( AUTO_MODE )); then
+    printf -v "$var" '%s' "${opts[def - 1]%%|*}"
+    echo "  $prompt -> ${!var} (automatisch)"
+    return 0
+  fi
   if (( USE_DIALOG )); then
     for i in "${!opts[@]}"; do items+=("${opts[i]%%|*}" "${opts[i]#*|}"); done
     sel=$(dlg --no-tags --default-item "${opts[def - 1]%%|*}" --menu "$prompt" 0 0 0 "${items[@]}") || dlg_abort
@@ -514,19 +552,109 @@ reread_partitions() {
   die "Der Kernel sieht die neuen Partitionen auf $disk nicht. Irgendetwas hält die Platte noch fest. Neu starten und das Skript erneut ausführen."
 }
 
+# ask_secret VAR "Frage" – optionaler geheimer Wert (einmal, ohne Echo, nicht im Protokoll)
+ask_secret() {
+  local var=$1 prompt=$2 val=""
+  if [[ -n ${!var+x} ]] || (( AUTO_MODE )); then printf -v "$var" '%s' "${!var-}"; return 0; fi
+  if (( USE_DIALOG )); then
+    val=$(dlg --insecure --passwordbox "$prompt" 0 0) || dlg_abort
+  else
+    read -rsp "$prompt: " val; echo
+  fi
+  printf -v "$var" '%s' "$val"
+}
+
+# Gerätename der Partition Nr. $2 auf Platte $1 (nvme0n1 -> nvme0n1p2, sda -> sda2)
+part_dev() {
+  if [[ $1 =~ [0-9]$ ]]; then echo "${1}p$2"; else echo "$1$2"; fi
+}
+
+# LUKS2 anlegen und öffnen: luks_setup GERÄT NAME; Passwort aus LUKS_PASS (nicht im Protokoll)
+luks_setup() {
+  printf '%s' "$LUKS_PASS" | cryptsetup luksFormat --type luks2 --batch-mode --key-file=- "$1"
+  printf '%s' "$LUKS_PASS" | cryptsetup open --key-file=- "$1" "$2"
+}
+
+# Passwort im neuen System setzen: set_password BENUTZER PASS-VAR HASH-VAR (1 = nichts vorgegeben)
+set_password() {
+  local u=$1 pass=${!2-} hash=${!3-}
+  if [[ -n $hash ]]; then
+    printf '%s:%s\n' "$u" "$hash" | nixos-enter --root /mnt -c 'chpasswd -e'
+  elif [[ -n $pass ]]; then
+    printf '%s:%s\n' "$u" "$pass" | nixos-enter --root /mnt -c 'chpasswd'
+  else
+    return 1
+  fi
+}
+
+# WLAN-Verbindungen des Live-Systems (NetworkManager)
+wifi_files() {
+  local f
+  for f in /etc/NetworkManager/system-connections/*.nmconnection /run/NetworkManager/system-connections/*.nmconnection; do
+    [[ -r $f ]] || continue
+    if grep -qE '^type=(wifi|802-11-wireless)$' "$f"; then echo "$f"; fi
+  done
+}
+
+# Andere ganze Platten als Auswahl (ohne $1, Installationsmedium und laufendes System)
+other_disks() {
+  local name size model
+  lsblk -dpno NAME,SIZE,MODEL -e 7,11 | while read -r name size model; do
+    [[ $(lsblk -dno TYPE "$name") == disk ]] || continue
+    [[ $name == "$1" || $name == "$LIVE_DEV" || $name == /dev/zram* ]] && continue
+    printf '%s|%-16s %8s  %s\n' "$name" "$name" "$size" "${model:-}"
+  done
+}
+
+# Dual-Boot: größten freien Bereich und die vorhandene EFI-Partition auf $DISK finden
+dualboot_plan() {
+  local kind a b c tmp
+  EFI_PART=""; EFI_SIZE_MIB=0; DB_START_MIB=0; DB_END_MIB=0; WINDOWS=0
+  [[ $(parted -m -s "$DISK" print 2>/dev/null | sed -n 2p | cut -d: -f6) == gpt ]] \
+    || die "Dual-Boot geht nur mit einer GPT-Partitionstabelle (UEFI)."
+  while read -r kind a b c; do
+    case $kind in
+      free) if (( c > DB_END_MIB - DB_START_MIB )); then DB_START_MIB=$a; DB_END_MIB=$b; fi ;;
+      esp)  if [[ -z $EFI_PART ]]; then EFI_PART=$(part_dev "$DISK" "$a"); EFI_SIZE_MIB=$b; fi ;;
+    esac
+  done < <(parted -m -s "$DISK" unit MiB print free | awk -F: 'NR > 2 {
+      for (i = 2; i <= 4; i++) sub(/MiB/, "", $i)
+      if ($5 == "free;") { s = int($2) + ($2 > int($2)); e = int($3); if (s < 1) s = 1; if (e > s) print "free", s, e, e - s }
+      else if ($7 ~ /esp/) print "esp", $1, int($4), 0
+    }')
+  [[ -n $EFI_PART ]] || die "Keine EFI-Partition auf $DISK gefunden. Für Dual-Boot muss dort schon ein UEFI-System sein."
+  if (( EFI_SIZE_MIB < 900 )); then XBOOT=1; else XBOOT=0; fi
+  local need=$(( DB_MIN_GB * 1024 + XBOOT * 1024 ))
+  if (( DB_END_MIB - DB_START_MIB < need )); then
+    die "Zu wenig freier Platz auf $DISK: $(( (DB_END_MIB - DB_START_MIB) / 1024 )) GiB, nötig sind mindestens $(( need / 1024 )) GiB. Platz vorher im anderen System freigeben (unter Windows: Datenträgerverwaltung -> Volume verkleinern)."
+  fi
+  # Windows auf der EFI-Partition?
+  tmp=$(mktemp -d)
+  if mount -o ro "$EFI_PART" "$tmp" 2>/dev/null; then
+    if [[ -d $tmp/EFI/Microsoft ]]; then WINDOWS=1; fi
+    umount "$tmp"
+  fi
+  rmdir "$tmp"
+}
+
 # ---------- Antwortdatei ----------
 # Alle Antworten, die gespeichert und wiederverwendet werden (DISK absichtlich nicht)
 ANSWER_VARS=(CHANNEL KB LOCALE TIMEZONE DESKTOP DESKTOP_MODE GPU NV_OPEN KERNEL PRINTING BLUETOOTH
   STEAM SAMBA LIBVIRT CONTAINERS FLATPAK UNFREE ENCRYPT UKI TPM2 SILENT SNAPPER BACKUP BACKUP_REPO
   HIBERNATE LID AUTOUPDATE LOGIN_SHELL OHMYZSH SSHD SSH_KEYS NIX_HOSTNAME NIX_USER EXTRA_USERS
   SWAP_GB ZRAM ESP_GB COMPRESS FINGERPRINT FIDO2_LUKS FIDO2_SUDO RESCUE HOME_MANAGER GIT_NAME
-  GIT_EMAIL)
-# Nicht gespeichert, weil rechnerspezifisch: DISK, HW_PROFILE
+  GIT_EMAIL FAIL2BAN NET_MODE NET_IF NET_ADDR NET_GW NET_DNS NET_ADDR6 NET_GW6 VPN)
+# Nicht gespeichert, weil rechnerspezifisch: DISK, DISK2, HW_PROFILE, INSTALL_MODE, DISK2_MODE
+# Geheime Werte, nur aus der Passwortdatei (PASSWORT_DATEI), werden nie gespeichert
+SECRET_VARS=(LUKS_PASS ROOT_PASS ROOT_HASH USER_PASS USER_HASH EXTRA_PASS EXTRA_HASH SAMBA_PASS
+  BACKUP_PASS TS_AUTHKEY)
 
 # Liest nur Zeilen der Form NAME='wert' mit bekannten Namen; nichts davon wird ausgeführt.
 # Per Umgebungsvariable gesetzte Werte haben Vorrang.
 load_answers() {
-  local src=$1 file line k v n=0
+  local src=$1 label=${2:-Antworten} file line k v n=0
+  local -a allowed=("${ANSWER_VARS[@]}")
+  if [[ $label == Passwörter ]]; then allowed=("${SECRET_VARS[@]}"); fi
   if [[ $src == http://* || $src == https://* ]]; then
     file=$(mktemp)
     curl -fsSL --max-time 30 "$src" -o "$file" || die "Antwortdatei $src nicht abrufbar."
@@ -538,13 +666,14 @@ load_answers() {
     if [[ $line =~ ^([A-Z][A-Z0-9_]*)=\'(.*)\'$ ]]; then
       k=${BASH_REMATCH[1]}
       v=${BASH_REMATCH[2]//\'\\\'\'/\'}
-      if [[ " ${ANSWER_VARS[*]} " == *" $k "* && -z ${!k+x} ]]; then
+      if [[ " ${allowed[*]} " == *" $k "* && -z ${!k+x} ]]; then
         printf -v "$k" '%s' "$v"
         n=$((n + 1))
       fi
     fi
   done < "$file"
-  echo "  $n Antworten aus $src übernommen."
+  if [[ $file != "$src" ]]; then rm -f "$file"; fi
+  echo "  $n $label aus $src übernommen."
 }
 
 save_answers() {
@@ -553,11 +682,12 @@ save_answers() {
     echo "# Antworten des NixOS-Installers vom $(date +%F) für $NIX_HOSTNAME"
     echo "# Wiederverwenden: ANTWORTEN=/pfad/zu/dieser/datei bash install.sh"
     echo "# Die Zielplatte (DISK) ist absichtlich nicht enthalten."
-    echo "# Hostname, Grafik (GPU) und Swap-Größe für einen anderen Rechner ggf. anpassen."
+    echo "# Hostname, Grafik (GPU), Swap-Größe und feste IP für einen anderen Rechner ggf. anpassen."
     for k in "${ANSWER_VARS[@]}"; do
       v=${!k-}
       if [[ -z $v ]]; then continue; fi
       if [[ $v == none && $k =~ ^(GPU|DESKTOP_MODE|LID)$ ]]; then continue; fi
+      if [[ $k == SWAP_GB && $DISK2_MODE == raid1 ]]; then continue; fi   # bei RAID1 erzwungen 0
       v=${v//\'/\'\\\'\'}
       printf "%s='%s'\n" "$k" "$v"
     done
@@ -576,7 +706,10 @@ write_mock_hw() {
   if (( SWAP_GB > 0 )); then
     printf '  fileSystems."/swap" = { device = "%s"; fsType = "btrfs"; options = [ "subvol=@swap" ]; };\n' "$dev"
   fi
-  if [[ $BOOT_MODE == uefi ]]; then
+  if (( XBOOT )); then
+    echo '  fileSystems."/efi" = { device = "/dev/disk/by-label/efi"; fsType = "vfat"; };'
+    echo '  fileSystems."/boot" = { device = "/dev/disk/by-label/xboot"; fsType = "vfat"; };'
+  elif [[ $BOOT_MODE == uefi ]]; then
     echo '  fileSystems."/boot" = { device = "/dev/disk/by-label/boot"; fsType = "vfat"; };'
   else
     echo '  fileSystems."/boot" = { device = "/dev/disk/by-label/boot"; fsType = "ext4"; };'
@@ -584,12 +717,16 @@ write_mock_hw() {
   if (( ENCRYPT )); then
     echo '  boot.initrd.luks.devices."cryptroot".device = "/dev/disk/by-uuid/00000000-0000-0000-0000-000000000000";'
   fi
+  case $DISK2_MODE in
+    data) echo '  fileSystems."/data" = { device = "/dev/disk/by-label/data"; fsType = "btrfs"; options = [ "subvol=@data" ]; };' ;;
+    keep) printf '  fileSystems."/data" = { device = "%s"; fsType = "%s"; };\n' "$DATA_PART" "$DATA_FSTYPE" ;;
+  esac
   echo '}'
 }
 
 # Baut configuration.nix aus allen Antworten; $1 = Zieldatei
 build_config() {
-  local CFG=$1
+  local CFG=$1 n n2 ns addrs routes dns wg_port
 # --- Bausteine ---
 IMPORTS='    ./hardware-configuration.nix'
 if (( UKI )); then IMPORTS+=$'\n    lanzaboote.nixosModules.lanzaboote'; fi
@@ -629,6 +766,12 @@ else
   BOOT_NIX='  boot.loader.systemd-boot.enable = true;
   boot.loader.systemd-boot.configurationLimit = 10;  # ESP nicht volllaufen lassen
   boot.loader.efi.canTouchEfiVariables = true;'
+  if (( XBOOT )); then
+    BOOT_NIX+='
+  # Dual-Boot mit kleiner EFI-Partition: Kernel und initrd liegen auf einer eigenen Boot-Partition (XBOOTLDR)
+  boot.loader.efi.efiSysMountPoint = "/efi";
+  boot.loader.systemd-boot.xbootldrMountPoint = "/boot";'
+  fi
   if (( RESCUE )); then
     BOOT_NIX+='
   boot.loader.systemd-boot.memtest86.enable = true;   # Eintrag „Memtest86+“: Arbeitsspeicher testen
@@ -636,6 +779,9 @@ else
   fi
 fi
 HEADER_NIX+=$'\n  imports = [\n'"$IMPORTS"$'\n  ];'
+if (( WINDOWS )); then
+  BOOT_NIX+=$'\n  time.hardwareClockInLocalTime = true;  # Windows stellt die Hardware-Uhr auf Ortszeit'
+fi
 
 KERNEL_NIX="  boot.kernelPackages = pkgs.$KERNEL_ATTR;"
 if [[ $KERNEL == latest ]]; then KERNEL_NIX+="  # neuester stabiler Kernel"; fi
@@ -656,8 +802,20 @@ if (( SILENT )); then
 fi
 
 LUKS_NIX=""
+LUKS_NAMES=()
 if (( ENCRYPT )); then
+  LUKS_NAMES=(cryptroot)
   LUKS_NIX='  boot.initrd.luks.devices."cryptroot".allowDiscards = true;  # TRIM durch LUKS durchreichen'
+  if [[ $DISK2_MODE == raid1 || $DISK2_MODE == data ]]; then
+    if [[ $DISK2_MODE == raid1 ]]; then n2=cryptroot2; else n2=cryptdata; fi
+    LUKS_NAMES+=("$n2")
+    LUKS_NIX+="
+  # zweite Platte, gleiches Passwort (wird beim Start nur einmal abgefragt)
+  boot.initrd.luks.devices.\"$n2\" = {
+    device = \"/dev/disk/by-uuid/$LUKS2_UUID\";
+    allowDiscards = true;
+  };"
+  fi
 fi
 if (( TPM2 )); then
   LUKS_NIX+='
@@ -668,12 +826,15 @@ if (( TPM2 && FIDO2_LUKS )); then
   LUKS_NIX+='
   # TPM2 und FIDO2: ohne feste Vorgabe probiert systemd alle eingerichteten Schlüssel, dann das Passwort'
 elif (( TPM2 )); then
-  LUKS_NIX+='
-  boot.initrd.luks.devices."cryptroot".crypttabExtraOpts = [ "tpm2-device=auto" ];'
+  for n in "${LUKS_NAMES[@]}"; do
+    LUKS_NIX+=$'\n  boot.initrd.luks.devices."'"$n"'".crypttabExtraOpts = [ "tpm2-device=auto" ];'
+  done
 elif (( FIDO2_LUKS )); then
   LUKS_NIX+='
-  # FIDO2: beim Start Schlüssel einstecken (ggf. PIN) und antippen; das Passwort geht weiterhin
-  boot.initrd.luks.devices."cryptroot".crypttabExtraOpts = [ "fido2-device=auto" ];'
+  # FIDO2: beim Start Schlüssel einstecken (ggf. PIN) und antippen; das Passwort geht weiterhin'
+  for n in "${LUKS_NAMES[@]}"; do
+    LUKS_NIX+=$'\n  boot.initrd.luks.devices."'"$n"'".crypttabExtraOpts = [ "fido2-device=auto" ];'
+  done
 fi
 
 FS_NIX="  fileSystems = {
@@ -686,6 +847,20 @@ if (( SWAP_GB > 0 )); then
   FS_NIX+="
     \"/swap\".options    = [ \"noatime\" ];"
 fi
+case $DISK2_MODE in
+  data)
+    FS_NIX+="
+    \"/data\".options    = [ \"compress=$COMPRESS\" \"noatime\" \"nofail\" ];  # zweite Platte" ;;
+  keep)
+    case $DATA_FSTYPE in
+      ntfs3|exfat|vfat)
+        FS_NIX+="
+    \"/data\".options    = [ \"nofail\" \"uid=1000\" \"gid=100\" \"umask=022\" ];  # vorhandene Daten, gehören $NIX_USER" ;;
+      *)
+        FS_NIX+="
+    \"/data\".options    = [ \"nofail\" ];  # vorhandene Daten" ;;
+    esac ;;
+esac
 FS_NIX+="
   };"
 
@@ -722,12 +897,69 @@ fi
 
 SCRUB_NIX='  services.btrfs.autoScrub = {
     enable = true;
-    interval = "monthly";
-    fileSystems = [ "/" ];  # reicht, gescrubbt wird das ganze Dateisystem
+    interval = "monthly";'
+if [[ $DISK2_MODE == data ]]; then
+  SCRUB_NIX+='
+    fileSystems = [ "/" "/data" ];'
+else
+  SCRUB_NIX+='
+    fileSystems = [ "/" ];  # reicht, gescrubbt wird das ganze Dateisystem'
+fi
+SCRUB_NIX+='
   };'
 
-NET_NIX="  networking.hostName = \"$NIX_HOSTNAME\";
+NET_NIX="  networking.hostName = \"$NIX_HOSTNAME\";"
+if [[ $NET_MODE == static ]]; then
+  addrs="\"$NET_ADDR\""; routes="{ Gateway = \"$NET_GW\"; }"; dns=""
+  if [[ -n $NET_ADDR6 ]]; then addrs+=" \"$NET_ADDR6\""; fi
+  if [[ -n $NET_GW6 ]]; then routes+=" { Gateway = \"$NET_GW6\"; }"; fi
+  for ns in $NET_DNS; do dns+=" \"$ns\""; done
+  NET_NIX+="
+  # Feste Adresse mit systemd-networkd
+  networking.networkmanager.enable = false;
+  networking.useDHCP = false;
+  networking.useNetworkd = true;
+  systemd.network.networks.\"10-lan\" = {
+    matchConfig.Name = \"$NET_IF\";
+    address = [ $addrs ];
+    routes = [ $routes ];
+    dns = [$dns ];"
+  if [[ -z $NET_ADDR6 ]]; then
+    NET_NIX+="
+    networkConfig.IPv6AcceptRA = true;  # IPv6 automatisch (SLAAC), wenn im Netz vorhanden"
+  fi
+  NET_NIX+="
+    linkConfig.RequiredForOnline = \"routable\";
+  };"
+else
+  NET_NIX+="
   networking.networkmanager.enable = true;"
+fi
+
+VPN_NIX=""
+case $VPN in
+  tailscale)
+    VPN_NIX='  services.tailscale = {
+    enable = true;
+    openFirewall = true;  # direkte Verbindungen statt Umweg über Relais'
+    if [[ -n ${TS_AUTHKEY-} ]]; then
+      VPN_NIX+='
+    authKeyFile = "/var/lib/tailscale/authkey";  # meldet sich beim ersten Start an'
+    fi
+    VPN_NIX+='
+  };' ;;
+  wireguard)
+    VPN_NIX='  networking.wg-quick.interfaces.wg0.configFile = "/etc/wireguard/wg0.conf";  # vom Installer kopiert'
+    wg_port=$(sed -n 's/^ListenPort[[:space:]]*=[[:space:]]*\([0-9]\+\).*/\1/p' <<<"$WG_CONF_TEXT" | head -n1)
+    if [[ -n $wg_port ]]; then
+      VPN_NIX+=$'\n  networking.firewall.allowedUDPPorts = [ '"$wg_port"' ];  # ListenPort aus wg0.conf'
+    fi
+    ;;
+esac
+if (( FAIL2BAN )); then
+  if [[ -n $VPN_NIX ]]; then VPN_NIX+=$'\n'; fi
+  VPN_NIX+='  services.fail2ban.enable = true;  # sperrt IPs nach wiederholten SSH-Fehlversuchen'
+fi
 
 LOCALE_NIX="  time.timeZone = \"$TIMEZONE\";
   i18n.defaultLocale = \"$LANG_LOCALE\";"
@@ -1039,18 +1271,23 @@ if [[ -n $SSH_KEYS_NIX ]]; then
     openssh.authorizedKeys.keys = [$SSH_KEYS_NIX
     ];"
 fi
-ADMIN_GROUPS='"wheel" "networkmanager" "audio"'
+if [[ $NET_MODE == static ]]; then NMGRP=''; else NMGRP=' "networkmanager"'; fi
+ADMIN_GROUPS='"wheel"'"$NMGRP"' "audio"'
 if (( LIBVIRT )); then ADMIN_GROUPS+=' "libvirtd"'; fi
 if [[ $CONTAINERS == docker ]]; then ADMIN_GROUPS+=' "docker"'; fi
+USER_UID=""
+if [[ $DISK2_MODE == keep && $DATA_FSTYPE =~ ^(ntfs3|exfat|vfat)$ ]]; then
+  USER_UID=$'\n    uid = 1000;  # passend zu den Rechten auf /data'
+fi
 USER_NIX="  users.users.\"$NIX_USER\" = {
-    isNormalUser = true;
+    isNormalUser = true;$USER_UID
     extraGroups = [ $ADMIN_GROUPS ];$USER_SHELL$USER_KEYS
   };"
 for u in $EXTRA_USERS; do
   USER_NIX+="
   users.users.\"$u\" = {
     isNormalUser = true;   # ohne Admin-Rechte
-    extraGroups = [ \"networkmanager\" \"audio\" ];$USER_SHELL
+    extraGroups = [${NMGRP} \"audio\" ];$USER_SHELL
   };"
 done
 
@@ -1305,7 +1542,7 @@ fi
 if (( TPM2 )); then
   PKG_NIX+="
     # LUKS an TPM2 binden (PCR 7 = Secure-Boot-Zustand), erst nach dem Aktivieren von Secure Boot
-    (writeShellScriptBin \"luks-tpm2-enroll\" \"exec \${systemd}/bin/systemd-cryptenroll --wipe-slot=tpm2 --tpm2-device=auto --tpm2-pcrs=7 /dev/disk/by-uuid/$LUKS_UUID\")"
+    (writeShellScriptBin \"luks-tpm2-enroll\" \"set -e; for u in $LUKS_UUID${LUKS2_UUID:+ $LUKS2_UUID}; do \${systemd}/bin/systemd-cryptenroll --wipe-slot=tpm2 --tpm2-device=auto --tpm2-pcrs=7 /dev/disk/by-uuid/\$u; done\")"
 fi
 if [[ $LOGIN_SHELL == zsh ]] && (( OHMYZSH && ! HOME_MANAGER )); then
   PKG_NIX+='
@@ -1343,6 +1580,7 @@ PKG_NIX+='
   emit "Grafik"                              "$GPU_NIX"
   emit "Drucken, Bluetooth, Spiele"          "$EXTRAS_NIX"
   emit "Netzwerkdienste finden (mDNS)"       "$AVAHI_NIX"
+  emit "VPN und Schutz"                      "$VPN_NIX"
   emit "Samba-Freigabe"                      "$SAMBA_NIX"
   emit "Virtualisierung und Container"       "$VIRT_NIX"
   emit "Schriften"                           "$FONTS_NIX"
@@ -1378,6 +1616,15 @@ if [[ -n ${ANTWORTEN:-} ]]; then
   info "Lese Antworten aus $ANTWORTEN"
   load_answers "$ANTWORTEN"
 fi
+if [[ -n ${PASSWORT_DATEI:-} ]]; then
+  [[ $PASSWORT_DATEI != http://* ]] || die "Die Passwortdatei nicht über unverschlüsseltes http laden."
+  info "Lese Passwörter aus $PASSWORT_DATEI"
+  load_answers "$PASSWORT_DATEI" Passwörter
+fi
+if is_yes "${AUTO:-n}"; then
+  AUTO_MODE=1
+  info "Automatikmodus: keine Rückfragen, fehlende Antworten = Vorschlag des Skripts"
+fi
 # Startmodus: wie der USB-Stick gestartet wurde; BOOT_MODE=bios erzwingt GRUB für Legacy-BIOS
 if [[ -d /sys/firmware/efi ]]; then FW_MODE=uefi; else FW_MODE=bios; fi
 BOOT_MODE=${BOOT_MODE:-$FW_MODE}
@@ -1390,7 +1637,7 @@ if [[ $BOOT_MODE == bios ]]; then
   info "Legacy-BIOS: Installation mit GRUB (ohne Secure Boot und UKI)"
   if [[ $FW_MODE == uefi ]]; then warn "Der Stick wurde per UEFI gestartet, installiert wird trotzdem für Legacy-BIOS."; fi
 fi
-for cmd in parted partprobe wipefs mkfs.fat mkfs.ext4 mkfs.btrfs btrfs cryptsetup curl nix-channel nix-instantiate nix-shell nixos-generate-config nixos-install nixos-enter udevadm; do
+for cmd in parted partprobe wipefs blkid mkfs.fat mkfs.ext4 mkfs.btrfs btrfs cryptsetup curl nix-channel nix-instantiate nix-shell nixos-generate-config nixos-install nixos-enter udevadm; do
   command -v "$cmd" >/dev/null || die "'$cmd' fehlt. Läuft das Skript im NixOS-Installer?"
 done
 ping -c1 -W3 cache.nixos.org >/dev/null 2>&1 || warn "Keine Verbindung zu cache.nixos.org. WLAN mit 'nmtui' einrichten."
@@ -1400,7 +1647,9 @@ export NIX_PATH="nixpkgs=/nix/var/nix/profiles/per-user/root/channels/nixos:/nix
 
 # Reste eines abgebrochenen Laufs aufräumen
 if mountpoint -q /mnt; then umount -R /mnt; fi
-if [[ -e /dev/mapper/cryptroot ]]; then cryptsetup close cryptroot; fi
+for m in cryptdata cryptroot2 cryptroot; do
+  if [[ -e /dev/mapper/$m ]]; then cryptsetup close "$m"; fi
+done
 
 : "${ESP_GB:=1}"
 : "${COMPRESS:=zstd}"
@@ -1418,10 +1667,11 @@ for b in /sys/class/power_supply/*; do
 done
 if grep -q GenuineIntel /proc/cpuinfo; then CPU_INTEL=1; else CPU_INTEL=0; fi
 if systemd-detect-virt -q 2>/dev/null; then IS_VM=1; else IS_VM=0; fi
-LUKS_UUID=""; RESUME_UUID=""; RESUME_OFFSET=0; AVAHI_SETTINGS=0
+LUKS_UUID=""; LUKS2_UUID=""; RESUME_UUID=""; RESUME_OFFSET=0; AVAHI_SETTINGS=0
+XBOOT=0; WINDOWS=0; DB_MIN_GB=${DB_MIN_GB:-20}; DATA_PART=${DATA_PART-}; DATA_FSTYPE=""
 
 # Menüs mit dialog, wenn ein Terminal da ist (TUI=n schaltet sie ab)
-if [[ ${TUI:-j} != [nN]* && -t 0 ]] && [[ -r /dev/tty ]]; then
+if [[ ${TUI:-j} != [nN]* && -t 0 ]] && [[ -r /dev/tty ]] && (( ! AUTO_MODE )); then
   echo "  Lade dialog für die Menüs ..."
   DIALOG_BIN=$(nix-build '<nixpkgs>' -A dialog --no-out-link 2>/dev/null)/bin/dialog || true
   if [[ -x $DIALOG_BIN ]]; then USE_DIALOG=1; else warn "dialog nicht verfügbar, frage im Textmodus."; fi
@@ -1439,6 +1689,28 @@ if src=$(findmnt -no SOURCE /iso 2>/dev/null) && [[ -b $src ]]; then
   LIVE_DEV=/dev/${pk:-$(basename "$src")}
 fi
 
+# ---------- Erweiterter Modus ----------
+ask_yn ADVANCED "Erweiterte Optionen anzeigen? (Dual-Boot, zweite Platte)" n
+if [[ -z ${INSTALL_MODE-} ]]; then
+  INSTALL_MODE=wipe
+  if (( ADVANCED )); then
+    if [[ $BOOT_MODE == uefi ]]; then
+      unset INSTALL_MODE
+      choose INSTALL_MODE "Wie soll NixOS auf die Platte?" 1 \
+        "wipe|Ganze Platte für NixOS (alles darauf wird gelöscht)" \
+        "dualboot|Neben vorhandenem System in den freien Platz (Dual-Boot, nichts wird gelöscht)"
+    else
+      note "Dual-Boot unterstützt das Skript nur mit UEFI."
+    fi
+  fi
+fi
+case $INSTALL_MODE in
+  wipe) ;;
+  dualboot) [[ $BOOT_MODE == uefi ]] || die "Dual-Boot geht nur mit UEFI." ;;
+  *) die "INSTALL_MODE muss wipe oder dualboot sein." ;;
+esac
+if (( AUTO_MODE )) && [[ -z ${DISK-} ]]; then die "Automatikmodus: DISK muss gesetzt sein."; fi
+
 DISK_OPTS=()
 while read -r name size model; do
   [[ $name == /dev/zram* || $name == "$LIVE_DEV" ]] && continue
@@ -1448,7 +1720,11 @@ done < <(lsblk -dpno NAME,SIZE,MODEL -e 7,11 | while read -r n rest; do
 done)
 (( ${#DISK_OPTS[@]} > 0 )) || die "Keine passende Platte gefunden."
 
-choose DISK "Auf welchen Datenträger soll NixOS? (wird KOMPLETT gelöscht)" 1 "${DISK_OPTS[@]}"
+if [[ $INSTALL_MODE == dualboot ]]; then
+  choose DISK "Auf welche Platte? (vorhandene Partitionen bleiben, NixOS kommt in den freien Platz)" 1 "${DISK_OPTS[@]}"
+else
+  choose DISK "Auf welchen Datenträger soll NixOS? (wird KOMPLETT gelöscht)" 1 "${DISK_OPTS[@]}"
+fi
 [[ -b $DISK ]] || die "$DISK ist kein Blockgerät."
 [[ $(lsblk -dno TYPE "$DISK") == disk ]] || die "$DISK ist keine ganze Platte."
 [[ $DISK != "$LIVE_DEV" ]] || die "$DISK ist das Installationsmedium."
@@ -1459,6 +1735,54 @@ for m in / /nix /nix/store /iso; do
     die "$DISK enthält $m des laufenden Systems."
   fi
 done
+
+if [[ $INSTALL_MODE == dualboot ]]; then
+  dualboot_plan
+  note "Dual-Boot auf $DISK: $(( (DB_END_MIB - DB_START_MIB) / 1024 )) GiB freier Platz, EFI-Partition $EFI_PART ($EFI_SIZE_MIB MiB)$(if (( XBOOT )); then echo ", zu klein für alle Kernel: NixOS bekommt eine eigene 1-GiB-Boot-Partition (ohne UKI)"; fi).$(if (( WINDOWS )); then echo " Windows erkannt: dort vorher den Schnellstart ausschalten und den BitLocker-Wiederherstellungsschlüssel bereithalten."; fi)"
+fi
+
+# ---------- Zweite Platte (erweitert) ----------
+DISK2_MODE=${DISK2_MODE:-}
+mapfile -t DISK2_OPTS < <(other_disks "$DISK")
+if [[ -z $DISK2_MODE ]]; then
+  DISK2_MODE=none
+  if (( ADVANCED )) && (( ${#DISK2_OPTS[@]} > 0 )); then
+    unset DISK2_MODE
+    choose DISK2_MODE "Zweite Platte verwenden?" 1 \
+      "none|Nein" \
+      "raid1|Als Spiegel (btrfs RAID1): beide Platten enthalten dasselbe, wird gelöscht" \
+      "data|Als neue Datenplatte unter /data, wird gelöscht" \
+      "keep|Vorhandene Daten behalten und unter /data einhängen"
+  fi
+fi
+case $DISK2_MODE in none|raid1|data|keep) ;; *) die "DISK2_MODE muss none, raid1, data oder keep sein." ;; esac
+if [[ $DISK2_MODE != none ]]; then
+  (( ${#DISK2_OPTS[@]} > 0 )) || die "Keine zweite Platte gefunden."
+  choose DISK2 "Welche Platte ist die zweite?" 1 "${DISK2_OPTS[@]}"
+  [[ -b $DISK2 && $DISK2 != "$DISK" && $DISK2 != "$LIVE_DEV" ]] || die "Ungültige zweite Platte: $DISK2"
+  for m in / /nix /nix/store /iso; do
+    src=$(findmnt -no SOURCE "$m" 2>/dev/null | sed 's/\[.*//' || true)
+    if [[ -b $src ]] && disk_devs "$DISK2" | grep -qxF "$(realpath "$src")"; then
+      die "$DISK2 enthält $m des laufenden Systems."
+    fi
+  done
+  if [[ $DISK2_MODE == keep ]]; then
+    DATA_OPTS=()
+    while read -r dn ds; do
+      dt=$(blkid -s TYPE -o value "$dn" 2>/dev/null || true)
+      dl=$(blkid -s LABEL -o value "$dn" 2>/dev/null || true)
+      case $dt in ext4|btrfs|xfs|ntfs|exfat|vfat) DATA_OPTS+=("$dn|$dn  $dt  $ds  $dl") ;; esac
+    done < <(lsblk -lnpo NAME,SIZE "$DISK2")
+    (( ${#DATA_OPTS[@]} > 0 )) || die "Auf $DISK2 gibt es kein Dateisystem, das sich einhängen lässt (ext4, btrfs, xfs, ntfs, exfat, vfat)."
+    choose DATA_PART "Welche Partition unter /data einhängen?" 1 "${DATA_OPTS[@]}"
+    DATA_FSTYPE=$(blkid -s TYPE -o value "$DATA_PART" 2>/dev/null || true)
+    [[ $DATA_FSTYPE =~ ^(ext4|btrfs|xfs|ntfs|exfat|vfat)$ ]] || die "$DATA_PART: Dateisystem '$DATA_FSTYPE' wird nicht unterstützt."
+    if [[ $DATA_FSTYPE == ntfs ]]; then DATA_FSTYPE=ntfs3; fi
+  fi
+  if [[ $DISK2_MODE == raid1 ]]; then
+    note "RAID1: Ein Swapfile ist auf btrfs mit zwei Platten nicht möglich, es gibt nur zram. Die Boot-Partition liegt nur auf $DISK."
+  fi
+fi
 
 # ---------- Version ----------
 LATEST_REL=$(detect_latest_release)
@@ -1677,10 +2001,13 @@ echo "Audio: PipeWire mit ALSA (inkl. 32 bit), PulseAudio- und JACK-Unterstützu
 # ---------- Verschlüsselung und Bootloader ----------
 echo
 ask_yn ENCRYPT    "Datenträger mit LUKS verschlüsseln?" n
-if [[ $BOOT_MODE == uefi ]]; then
+if (( ENCRYPT )); then
+  ask_pass LUKS_PASS "Passwort für die Verschlüsselung (wird bei jedem Start abgefragt)"
+fi
+if [[ $BOOT_MODE == uefi ]] && (( ! XBOOT )); then
   ask_yn UKI      "UKI (Unified Kernel Image) über lanzaboote? Bereitet Secure Boot vor" n
 else
-  if is_yes "${UKI:-n}"; then note "UKI und Secure Boot gibt es nur mit UEFI, wird übersprungen."; fi
+  if is_yes "${UKI:-n}"; then note "UKI gibt es nur mit UEFI und einer EFI-Partition ab 1 GiB, wird übersprungen."; fi
   UKI=0
 fi
 TPM2=${TPM2:-}
@@ -1730,6 +2057,7 @@ fi
 ask_yn AUTOUPDATE "Automatische Updates (nachts, ohne Neustart)?" n
 
 # ---------- Laptop ----------
+if [[ $DISK2_MODE == raid1 ]]; then HIBERNATE=0; fi   # kein Swapfile auf btrfs mit zwei Platten
 if (( LAPTOP )); then
   echo
   ask_yn HIBERNATE "Laptop erkannt. Ruhezustand (Hibernate) ermöglichen? Das Swapfile wird dafür mindestens so groß wie der RAM (${RAM_GIB} GiB)" j
@@ -1777,6 +2105,78 @@ if (( SSHD )); then
   if [[ -z $SSH_KEYS_NIX ]]; then
     note "Ohne Schlüssel ist kein SSH-Login möglich. Später unter users.users.<name>.openssh.authorizedKeys.keys eintragen."
   fi
+  ask_yn FAIL2BAN "SSH mit fail2ban absichern? (sperrt IPs nach wiederholten Fehlversuchen)" j
+else
+  FAIL2BAN=0
+fi
+
+# ---------- Netzwerk (ohne Desktop) ----------
+if [[ $DESKTOP == none ]]; then
+  choose NET_MODE "Netzwerk?" 1 \
+    "dhcp|Automatisch (DHCP)" \
+    "static|Feste IP-Adresse"
+else
+  NET_MODE=${NET_MODE:-dhcp}
+fi
+case $NET_MODE in dhcp|static) ;; *) die "NET_MODE muss dhcp oder static sein." ;; esac
+if [[ $NET_MODE == static ]]; then
+  if [[ -z ${NET_IF-} ]]; then
+    NET_IFS=()
+    for n in /sys/class/net/*; do
+      i=${n##*/}
+      if [[ $i == lo || -d $n/wireless || ! -e $n/device ]]; then continue; fi   # nur Netzwerkkarten mit Kabel
+      NET_IFS+=("$i|$i  ($(<"$n/address"), $(<"$n/operstate"))")
+    done
+    (( ${#NET_IFS[@]} > 0 )) || die "Keine kabelgebundene Netzwerkkarte gefunden."
+    choose NET_IF "Welche Netzwerkkarte?" 1 "${NET_IFS[@]}"
+  fi
+  [[ $NET_IF =~ ^[A-Za-z0-9_.:-]+$ ]] || die "Ungültiger Name der Netzwerkkarte: $NET_IF"
+  # Vorschläge aus der aktuellen Verbindung
+  cur_addr=$(ip -4 -o addr show dev "$NET_IF" 2>/dev/null | awk '{print $4; exit}' || true)
+  cur_gw=$(ip -4 route show default 2>/dev/null | awk '{print $3; exit}' || true)
+  cur_dns=$(awk '$1 == "nameserver" && $2 !~ /^127\./ {printf "%s ", $2}' /etc/resolv.conf 2>/dev/null || true)
+  ask NET_ADDR "IPv4-Adresse mit Präfix, z. B. 192.168.1.10/24" "$cur_addr" \
+    '^([0-9]{1,3}\.){3}[0-9]{1,3}/[0-9]{1,2}$' "Form: 192.168.1.10/24"
+  ask NET_GW "Gateway (Router)" "$cur_gw" '^([0-9]{1,3}\.){3}[0-9]{1,3}$' "Form: 192.168.1.1"
+  ask NET_DNS "DNS-Server, durch Leerzeichen getrennt" "${cur_dns% }" '^[0-9a-fA-F:. ]+$' "Nur IP-Adressen, z. B. 192.168.1.1 9.9.9.9"
+  ask NET_ADDR6 "IPv6-Adresse mit Präfix (leer = automatisch per SLAAC)" "" '^([0-9a-fA-F:]+/[0-9]{1,3})?$' "Form: 2001:db8::10/64"
+  if [[ -n $NET_ADDR6 ]]; then
+    ask NET_GW6 "IPv6-Gateway (leer = keins)" "" '^([0-9a-fA-F:]+)?$' "Form: fe80::1 oder 2001:db8::1"
+  else
+    NET_GW6=${NET_GW6-}
+  fi
+else
+  NET_IF=${NET_IF-}; NET_ADDR=${NET_ADDR-}; NET_GW=${NET_GW-}; NET_DNS=${NET_DNS-}; NET_ADDR6=${NET_ADDR6-}; NET_GW6=${NET_GW6-}
+fi
+
+# ---------- VPN ----------
+choose VPN "VPN?" 1 \
+  "none|Keins" \
+  "tailscale|Tailscale" \
+  "wireguard|WireGuard (vorhandene wg0.conf übernehmen)"
+case $VPN in none|tailscale|wireguard) ;; *) die "VPN muss none, tailscale oder wireguard sein." ;; esac
+WG_CONF_TEXT=""
+if [[ $VPN == tailscale ]]; then
+  ask_secret TS_AUTHKEY "Tailscale-Auth-Key (leer = nach dem Start: sudo tailscale up)"
+elif [[ $VPN == wireguard ]]; then
+  ask WG_CONF "Pfad oder https-URL zur WireGuard-Konfiguration (wg0.conf)" "" '^.+$' "Bitte einen Pfad oder eine URL angeben"
+  if [[ $WG_CONF == https://* ]]; then
+    WG_CONF_TEXT=$(curl -fsSL --max-time 30 "$WG_CONF") || die "WireGuard-Konfiguration nicht abrufbar: $WG_CONF"
+  else
+    [[ -r $WG_CONF ]] || die "WireGuard-Konfiguration nicht lesbar: $WG_CONF"
+    WG_CONF_TEXT=$(<"$WG_CONF")
+  fi
+  grep -q '^\[Interface\]' <<<"$WG_CONF_TEXT" && grep -q '^PrivateKey' <<<"$WG_CONF_TEXT" \
+    || die "$WG_CONF sieht nicht nach einer wg-quick-Konfiguration aus ([Interface] mit PrivateKey fehlt)."
+fi
+
+# ---------- WLAN übernehmen ----------
+mapfile -t WIFI_FILES < <(wifi_files)
+if [[ $NET_MODE != static ]] && (( ${#WIFI_FILES[@]} > 0 )); then
+  ssids=$(sed -n 's/^ssid=//p' "${WIFI_FILES[@]}" | sort -u | paste -sd, - | sed 's/,/, /g')
+  ask_yn WIFI_COPY "WLAN aus dem Live-System übernehmen ($ssids)? Dann ist das neue System gleich online." j
+else
+  WIFI_COPY=0
 fi
 
 # ---------- Weitere Angaben ----------
@@ -1793,6 +2193,7 @@ for u in $EXTRA_USERS; do
   [[ $u != "$NIX_USER" && $u != root ]] || die "Benutzer $u ist schon vergeben."
 done
 
+if [[ $DISK2_MODE == raid1 ]]; then SWAP_GB=0; fi   # Swapfile geht nicht auf btrfs mit zwei Platten
 if (( HIBERNATE )); then swapdef=$RAM_GIB; else swapdef=8; fi
 ask SWAP_GB "Swapfile in GiB (0 = kein Swap)" "$swapdef" '^[0-9]+$' "Bitte eine ganze Zahl eingeben"
 [[ $SWAP_GB =~ ^[0-9]+$ ]] || die "Swap-Größe muss eine ganze Zahl sein."
@@ -1803,7 +2204,9 @@ fi
 
 # nvme0n1 -> nvme0n1p1, sda -> sda1
 if [[ $DISK =~ [0-9]$ ]]; then P="${DISK}p"; else P="$DISK"; fi
-if [[ $BOOT_MODE == uefi ]]; then
+if [[ $INSTALL_MODE == dualboot ]]; then
+  BOOTPART=""; ROOTPART=""; BOOT_START_MIB=$DB_START_MIB   # werden beim Partitionieren ermittelt
+elif [[ $BOOT_MODE == uefi ]]; then
   BOOTPART="${P}1"; ROOTPART="${P}2"; BOOT_START_MIB=1
 else
   BIOSPART="${P}1"; BOOTPART="${P}2"; ROOTPART="${P}3"; BOOT_START_MIB=2   # 1 MiB BIOS-Boot davor
@@ -1825,6 +2228,16 @@ case $KERNEL in
   lts)    KERNEL_ATTR=linuxPackages ;;
   *)      die "KERNEL muss latest oder lts sein." ;;
 esac
+
+if (( AUTO_MODE )); then
+  [[ ${CONFIRM_DISK-} == "$DISK" ]] || die "Automatikmodus: CONFIRM_DISK muss $DISK sein (Schutz vor versehentlichem Löschen)."
+  if [[ $DISK2_MODE == raid1 || $DISK2_MODE == data ]]; then
+    [[ ${CONFIRM_DISK2-} == "$DISK2" ]] || die "Automatikmodus: CONFIRM_DISK2 muss $DISK2 sein."
+  fi
+  [[ -n ${USER_PASS-}${USER_HASH-} ]] || die "Automatikmodus: USER_PASS oder USER_HASH muss in der Passwortdatei stehen."
+  [[ -z $EXTRA_USERS || -n ${EXTRA_PASS-}${EXTRA_HASH-} ]] || die "Automatikmodus: EXTRA_PASS oder EXTRA_HASH fehlt für die weiteren Benutzer."
+  [[ $SAMBA != server || -n ${SAMBA_PASS-} ]] || die "Automatikmodus: SAMBA_PASS fehlt."
+fi
 
 # =====================================================================
 #  Paketquelle und Vorabprüfung (es wurde noch nichts gelöscht)
@@ -1860,6 +2273,7 @@ info "Prüfe die Konfiguration, bevor etwas gelöscht wird (dauert etwas)"
 PRE=$(mktemp -d /tmp/nixos-vorab.XXXXXX)
 write_mock_hw > "$PRE/hardware-configuration.nix"
 LUKS_UUID=00000000-0000-0000-0000-000000000000
+if [[ $DISK2_MODE == raid1 || $DISK2_MODE == data ]]; then LUKS2_UUID=00000000-0000-0000-0000-000000000000; fi
 RESUME_UUID=00000000-0000-0000-0000-000000000000
 RESUME_OFFSET=0
 build_config "$PRE/configuration.nix"
@@ -1876,17 +2290,28 @@ while ! nix-instantiate '<nixpkgs/nixos>' -A system -I "nixos-config=$PRE/config
 done
 if grep -qi 'evaluation warning' "$PRE/ergebnis.txt"; then grep -i -A1 'evaluation warning' "$PRE/ergebnis.txt" | head -n 10; fi
 echo "  Konfiguration ist gültig."
+LUKS2_UUID=""   # Platzhalter; der echte Wert kommt beim Einrichten der zweiten Platte
 
 # ---------- Zusammenfassung ----------
 SUMMARY=$(cat <<EOF
-  Datenträger:    $DISK
-$(if [[ $BOOT_MODE == uefi ]]; then
+  Datenträger:    $DISK$(if [[ $INSTALL_MODE == dualboot ]]; then echo " (Dual-Boot, vorhandene Partitionen bleiben)"; fi)
+$(if [[ $INSTALL_MODE == dualboot ]]; then
+    echo "    $EFI_PART  vorhandene EFI-Partition -> $(if (( XBOOT )); then echo /efi; else echo /boot; fi)"
+    if (( XBOOT )); then echo "    neu: 1 GiB FAT32 -> /boot (XBOOTLDR)"; fi
+    echo "    neu: $(( (DB_END_MIB - DB_START_MIB - XBOOT * 1024) / 1024 )) GiB im freien Bereich, $( if (( ENCRYPT )); then echo "LUKS2 -> btrfs"; else echo "btrfs"; fi ) ($COMPRESS)"
+  elif [[ $BOOT_MODE == uefi ]]; then
     echo "    ${BOOTPART}  ${ESP_GB} GiB FAT32 -> /boot (EFI)"
+    echo "    ${ROOTPART}  Rest, $( if (( ENCRYPT )); then echo "LUKS2 -> btrfs"; else echo "btrfs"; fi ) ($COMPRESS)"
   else
     echo "    ${BIOSPART}  1 MiB BIOS-Boot (für GRUB)"
     echo "    ${BOOTPART}  ${ESP_GB} GiB ext4 -> /boot"
+    echo "    ${ROOTPART}  Rest, $( if (( ENCRYPT )); then echo "LUKS2 -> btrfs"; else echo "btrfs"; fi ) ($COMPRESS)"
   fi)
-    ${ROOTPART}  Rest, $( if (( ENCRYPT )); then echo "LUKS2 -> btrfs"; else echo "btrfs"; fi ) ($COMPRESS)
+$(case $DISK2_MODE in
+    raid1) echo "  Zweite Platte:  $DISK2 wird gelöscht, btrfs RAID1 mit $DISK" ;;
+    data)  echo "  Zweite Platte:  $DISK2 wird gelöscht, neue Datenplatte unter /data" ;;
+    keep)  echo "  Zweite Platte:  $DATA_PART ($DATA_FSTYPE) bleibt erhalten, unter /data" ;;
+  esac)
   Version:        $CHANNEL_NAME
   Bootloader:     $( if [[ $BOOT_MODE == bios ]]; then echo "GRUB, Legacy-BIOS ($GRUB_DEV)"; elif (( UKI )); then echo "UKI via lanzaboote (Secure-Boot-Schlüssel werden erzeugt)"; else echo "systemd-boot (UEFI)"; fi )
   Kernel:         $(if [[ $KERNEL == latest ]]; then echo "neuester stabiler (linuxPackages_latest)"; else echo "Standard des Releases (linuxPackages)"; fi)
@@ -1919,47 +2344,107 @@ $(if [[ $BOOT_MODE == uefi ]]; then
   Hostname:       $NIX_HOSTNAME
   Benutzer:       $NIX_USER (Admin)${EXTRA_USERS:+, $EXTRA_USERS}
   Swap:           ${SWAP_GB} GiB Swapfile$(if (( ZRAM )); then echo " + zram"; fi)
-  SSH:            $(yn "$SSHD")$(if (( SSHD )); then if [[ -n $SSH_KEYS_NIX ]]; then echo " ($(grep -c . <<<"$SSH_KEYS_NIX") Schlüssel)"; else echo " (noch ohne Schlüssel)"; fi; fi)
+  SSH:            $(yn "$SSHD")$(if (( SSHD )); then if [[ -n $SSH_KEYS_NIX ]]; then echo " ($(grep -c . <<<"$SSH_KEYS_NIX") Schlüssel)"; else echo " (noch ohne Schlüssel)"; fi; fi)$(if (( FAIL2BAN )); then echo ", fail2ban"; fi)
+  Netzwerk:       $(if [[ $NET_MODE == static ]]; then echo "fest: $NET_IF $NET_ADDR, Gateway $NET_GW, DNS $NET_DNS${NET_ADDR6:+, $NET_ADDR6}"; else echo "automatisch (NetworkManager)$(if (( WIFI_COPY )); then echo ", WLAN wird übernommen"; fi)"; fi)
+  VPN:            $(case $VPN in none) echo nein ;; tailscale) echo "Tailscale$(if [[ -n ${TS_AUTHKEY-} ]]; then echo " (meldet sich automatisch an)"; fi)" ;; wireguard) echo "WireGuard wg0 aus $WG_CONF" ;; esac)
 EOF
 )
 info "Zusammenfassung"
 printf '%s\n\n' "$SUMMARY"
-DISK_INFO=$(lsblk -po NAME,SIZE,TYPE,FSTYPE,LABEL,MOUNTPOINTS "$DISK")
-if (( USE_DIALOG )); then
-  dlg --title "Zusammenfassung (Pfeiltasten blättern)" --cr-wrap --no-collapse \
-      --yes-label "Weiter" --no-label "Abbrechen" --yesno "$SUMMARY" 0 0 || dlg_abort
-  confirm=$(dlg --title "Letzte Sicherheitsabfrage" --cr-wrap --no-collapse --inputbox \
-    "ALLE Daten auf $DISK werden gelöscht:"$'\n\n'"$DISK_INFO"$'\n\n'"Eingehängtes, Swap, LVM, RAID und LUKS werden vorher gelöst."$'\n'"Zum Fortfahren den Gerätenamen ($DISK) eingeben:" 0 0) || dlg_abort
-  clear >/dev/tty 2>/dev/null || true
+# confirm_disk GERÄT "Text" – Gerätenamen zur Bestätigung eintippen lassen
+confirm_disk() {
+  local dev=$1 text=$2 info answer
+  info=$(lsblk -po NAME,SIZE,TYPE,FSTYPE,LABEL,MOUNTPOINTS "$dev")
+  if (( USE_DIALOG )); then
+    answer=$(dlg --title "Sicherheitsabfrage" --cr-wrap --no-collapse --inputbox \
+      "$text"$'\n\n'"$info"$'\n\n'"Zum Fortfahren den Gerätenamen ($dev) eingeben:" 0 0) || dlg_abort
+  else
+    warn "$text"
+    printf '%s\n' "$info"
+    read -rp "Zum Fortfahren den Gerätenamen ($dev) eingeben: " answer
+  fi
+  [[ $answer == "$dev" ]] || die "Abgebrochen, nichts verändert."
+}
+
+if (( AUTO_MODE )); then
+  echo "  Automatikmodus: Bestätigung über CONFIRM_DISK=$CONFIRM_DISK${CONFIRM_DISK2:+, CONFIRM_DISK2=$CONFIRM_DISK2}"
 else
-  warn "ALLE Daten auf $DISK werden gelöscht:"
-  printf '%s\n' "$DISK_INFO"
-  echo "Eingehängte Partitionen, Swap, LVM, RAID und LUKS auf $DISK werden vorher automatisch gelöst."
-  read -rp "Zum Fortfahren den Gerätenamen ($DISK) erneut eingeben: " confirm
+  if (( USE_DIALOG )); then
+    dlg --title "Zusammenfassung (Pfeiltasten blättern)" --cr-wrap --no-collapse \
+        --yes-label "Weiter" --no-label "Abbrechen" --yesno "$SUMMARY" 0 0 || dlg_abort
+  fi
+  if [[ $INSTALL_MODE == dualboot ]]; then
+    confirm_disk "$DISK" "Auf $DISK werden im freien Bereich neue Partitionen angelegt. Vorhandene Partitionen bleiben unverändert, trotzdem vorher ein Backup machen."
+  else
+    confirm_disk "$DISK" "ALLE Daten auf $DISK werden gelöscht. Eingehängtes, Swap, LVM, RAID und LUKS werden vorher gelöst."
+  fi
+  if [[ $DISK2_MODE == raid1 || $DISK2_MODE == data ]]; then
+    confirm_disk "$DISK2" "ALLE Daten auf der zweiten Platte $DISK2 werden gelöscht."
+  fi
+  if (( USE_DIALOG )); then clear >/dev/tty 2>/dev/null || true; fi
 fi
-[[ $confirm == "$DISK" ]] || die "Abgebrochen, nichts verändert."
 WIPED=1
 
 # =====================================================================
 #  Platte vorbereiten
 # =====================================================================
 
-info "Gebe $DISK frei"
-release_disk "$DISK"
-if lsblk -nro MOUNTPOINTS "$DISK" | grep -q . || [[ $(lsblk -lnpo NAME "$DISK" | grep -c /dev/mapper/ || true) -gt 0 ]]; then
-  lsblk -po NAME,TYPE,MOUNTPOINTS "$DISK" >&2
-  die "$DISK ist noch belegt und ließ sich nicht freigeben."
+# Platte freigeben und Signaturen entfernen (nicht bei Dual-Boot)
+wipe_disk() {
+  info "Gebe $1 frei"
+  release_disk "$1"
+  if lsblk -nro MOUNTPOINTS "$1" | grep -q . || [[ $(lsblk -lnpo NAME "$1" | grep -c /dev/mapper/ || true) -gt 0 ]]; then
+    lsblk -po NAME,TYPE,MOUNTPOINTS "$1" >&2
+    die "$1 ist noch belegt und ließ sich nicht freigeben."
+  fi
+  while read -r part; do
+    wipefs -af "$part" >/dev/null
+  done < <(lsblk -lnpo NAME "$1" | tail -n +2)
+  wipefs -af "$1" >/dev/null
+  udevadm settle
+}
+
+# Wartet, bis der Kernel die Partition $1 sieht
+wait_part() {
+  local i
+  for i in 1 2 3 4 5 6 7 8 9 10; do
+    udevadm settle
+    partprobe "$2" 2>/dev/null || partx -u "$2" 2>/dev/null || true
+    if [[ -b $1 ]]; then return 0; fi
+    sleep 1
+  done
+  die "Der Kernel sieht die neue Partition $1 nicht. Neu starten und erneut versuchen."
+}
+
+if [[ $INSTALL_MODE != dualboot ]]; then
+  wipe_disk "$DISK"
 fi
-
 info "Partitioniere $DISK"
-# alte Signaturen der Partitionen und der Platte entfernen
-while read -r part; do
-  wipefs -af "$part" >/dev/null
-done < <(lsblk -lnpo NAME "$DISK" | tail -n +2)
-wipefs -af "$DISK" >/dev/null
-udevadm settle
 
-if [[ $BOOT_MODE == uefi ]]; then
+if [[ $INSTALL_MODE == dualboot ]]; then
+  # Nur im freien Bereich neue Partitionen anlegen; ihre Nummern über den Startpunkt finden
+  s=$DB_START_MIB
+  if (( XBOOT )); then
+    parted -s "$DISK" -- unit MiB mkpart XBOOTLDR fat32 "$s" "$(( s + 1024 ))" mkpart nixos btrfs "$(( s + 1024 ))" "$DB_END_MIB"
+  else
+    parted -s "$DISK" -- unit MiB mkpart nixos btrfs "$s" "$DB_END_MIB"
+  fi
+  pnum() { parted -m -s "$DISK" unit MiB print | awk -F: -v s="$1" 'NR > 2 { sub(/MiB/, "", $2); if ($2 + 0 >= s - 0.5 && $2 + 0 <= s + 0.5) { print $1; exit } }'; }
+  if (( XBOOT )); then
+    xnr=$(pnum "$s"); [[ -n $xnr ]] || die "Neue Boot-Partition nicht gefunden."
+    parted -s "$DISK" -- set "$xnr" bls_boot on
+    BOOTPART=$(part_dev "$DISK" "$xnr")
+    rnr=$(pnum "$(( s + 1024 ))")
+  else
+    BOOTPART=$EFI_PART
+    rnr=$(pnum "$s")
+  fi
+  [[ -n $rnr ]] || die "Neue NixOS-Partition nicht gefunden."
+  ROOTPART=$(part_dev "$DISK" "$rnr")
+  wait_part "$ROOTPART" "$DISK"
+  if (( XBOOT )); then wait_part "$BOOTPART" "$DISK"; fi
+  echo "  neu: $(if (( XBOOT )); then echo "$BOOTPART (Boot, XBOOTLDR), "; fi)$ROOTPART (NixOS)"
+elif [[ $BOOT_MODE == uefi ]]; then
   parted_ok=1
   parted -s "$DISK" -- \
     mklabel gpt \
@@ -1977,10 +2462,17 @@ else
     mkpart nixos btrfs "${BOOT_END_MIB}MiB" 100% \
     disk_set pmbr_boot on || parted_ok=0
 fi
-if (( ! parted_ok )); then warn "parted meldet einen Fehler, lese die Partitionstabelle erneut ein."; fi
-reread_partitions "$DISK"
+if [[ $INSTALL_MODE != dualboot ]]; then
+  if (( ! parted_ok )); then warn "parted meldet einen Fehler, lese die Partitionstabelle erneut ein."; fi
+  reread_partitions "$DISK"
+fi
 
-if [[ $BOOT_MODE == uefi ]]; then
+if [[ $INSTALL_MODE == dualboot ]]; then
+  if (( XBOOT )); then
+    info "Formatiere die neue Boot-Partition"
+    mkfs.fat -F 32 -n XBOOT "$BOOTPART" >/dev/null
+  fi
+elif [[ $BOOT_MODE == uefi ]]; then
   info "Formatiere EFI-Partition"
   mkfs.fat -F 32 -n boot "$BOOTPART" >/dev/null
 else
@@ -1988,18 +2480,42 @@ else
   mkfs.ext4 -q -F -L boot "$BOOTPART"
 fi
 
+# Zweite Platte vorbereiten
+D2PART=""; BTRFS_DEV2=""
+if [[ $DISK2_MODE == raid1 || $DISK2_MODE == data ]]; then
+  wipe_disk "$DISK2"
+  info "Partitioniere $DISK2"
+  parted -s "$DISK2" -- mklabel gpt mkpart data btrfs 1MiB 100%
+  D2PART=$(part_dev "$DISK2" 1)
+  wait_part "$D2PART" "$DISK2"
+fi
+
 if (( ENCRYPT )); then
-  info "Richte LUKS2 ein – Passphrase zweimal eingeben, danach zum Öffnen ein drittes Mal"
-  cryptsetup luksFormat --type luks2 --batch-mode --verify-passphrase "$ROOTPART"
-  cryptsetup open "$ROOTPART" cryptroot
+  info "Richte LUKS2 ein"
+  luks_setup "$ROOTPART" cryptroot
   LUKS_UUID=$(cryptsetup luksUUID "$ROOTPART")
   BTRFS_DEV=/dev/mapper/cryptroot
+  if [[ -n $D2PART ]]; then
+    if [[ $DISK2_MODE == raid1 ]]; then n2=cryptroot2; else n2=cryptdata; fi
+    luks_setup "$D2PART" "$n2"
+    LUKS2_UUID=$(cryptsetup luksUUID "$D2PART")
+    BTRFS_DEV2=/dev/mapper/$n2
+  fi
 else
   BTRFS_DEV=$ROOTPART
+  BTRFS_DEV2=$D2PART
 fi
 
 info "Formatiere btrfs"
-mkfs.btrfs -f -L nixos "$BTRFS_DEV" >/dev/null
+if [[ $DISK2_MODE == raid1 ]]; then
+  mkfs.btrfs -f -L nixos -m raid1 -d raid1 "$BTRFS_DEV" "$BTRFS_DEV2" >/dev/null
+  btrfs device scan >/dev/null 2>&1 || true
+else
+  mkfs.btrfs -f -L nixos "$BTRFS_DEV" >/dev/null
+fi
+if [[ $DISK2_MODE == data ]]; then
+  mkfs.btrfs -f -L data "$BTRFS_DEV2" >/dev/null
+fi
 
 info "Lege Subvolumes an"
 SUBVOLS=(@ @home @nix @log)
@@ -2022,11 +2538,28 @@ if (( SWAP_GB > 0 )); then
   mkdir -p /mnt/swap
   mount -o "subvol=@swap,noatime" "$BTRFS_DEV" /mnt/swap
 fi
-if [[ $BOOT_MODE == uefi ]]; then
+if [[ $INSTALL_MODE == dualboot ]] && (( XBOOT )); then
+  mount -o umask=077 "$BOOTPART" /mnt/boot
+  mkdir -p /mnt/efi
+  mount -o umask=077 "$EFI_PART" /mnt/efi
+elif [[ $BOOT_MODE == uefi ]]; then
   mount -o umask=077 "$BOOTPART" /mnt/boot
 else
   mount "$BOOTPART" /mnt/boot
 fi
+case $DISK2_MODE in
+  data)
+    mkdir -p /mnt/data
+    mount "$BTRFS_DEV2" /mnt/data
+    btrfs subvolume create /mnt/data/@data >/dev/null
+    umount /mnt/data
+    mount -o "subvol=@data,$OPTS" "$BTRFS_DEV2" /mnt/data ;;
+  keep)
+    mkdir -p /mnt/data
+    if [[ $DATA_FSTYPE == ntfs3 ]]; then dm=(-t ntfs3); else dm=(); fi
+    mount "${dm[@]}" "$DATA_PART" /mnt/data \
+      || die "$DATA_PART ließ sich nicht einhängen. Bei Windows-Platten: Schnellstart ausschalten und Windows ganz herunterfahren." ;;
+esac
 if (( SNAPPER )); then
   btrfs subvolume create /mnt/home/.snapshots >/dev/null
   chmod 750 /mnt/home/.snapshots
@@ -2087,6 +2620,7 @@ fi
 CHANNELS_PATH=$(readlink -f /nix/var/nix/profiles/per-user/root/channels)
 while ! nixos-install --no-root-passwd --channel "$CHANNELS_PATH"; do
   warn "nixos-install ist fehlgeschlagen. Die Ursache steht oben und im Protokoll."
+  if (( AUTO_MODE )); then die "Automatikmodus: Installation fehlgeschlagen. Konfiguration: $CFG, eingehängt unter /mnt."; fi
   unset RETRY
   choose RETRY "Wie weiter?" 1 \
     "edit|configuration.nix bearbeiten und erneut versuchen" \
@@ -2104,14 +2638,29 @@ install -d -m 700 /mnt/root
 nix-channel --list | awk 'NF == 2 { print $2, $1 }' > /mnt/root/.nix-channels
 
 info "root-Passwort setzen"
-until nixos-enter --root /mnt -c 'passwd root'; do warn "Nochmal versuchen."; done
+if set_password root ROOT_PASS ROOT_HASH; then
+  echo "  aus der Passwortdatei"
+elif (( AUTO_MODE )); then
+  echo "  keins angegeben: root bleibt gesperrt, Verwaltung über sudo"
+else
+  until nixos-enter --root /mnt -c 'passwd root'; do warn "Nochmal versuchen."; done
+fi
 
 info "Passwort für $NIX_USER setzen"
-until nixos-enter --root /mnt -c "passwd $NIX_USER"; do warn "Nochmal versuchen."; done
+if set_password "$NIX_USER" USER_PASS USER_HASH; then
+  echo "  aus der Passwortdatei"
+else
+  until nixos-enter --root /mnt -c "passwd $NIX_USER"; do warn "Nochmal versuchen."; done
+fi
 
 for u in $EXTRA_USERS; do
   info "Passwort für $u setzen"
-  until nixos-enter --root /mnt -c "passwd $u"; do warn "Nochmal versuchen."; done
+  if set_password "$u" EXTRA_PASS EXTRA_HASH; then
+    nixos-enter --root /mnt -c "chage -d 0 $u"   # beim ersten Anmelden ein eigenes Passwort wählen
+    echo "  Startpasswort aus der Passwortdatei, muss beim ersten Anmelden geändert werden"
+  else
+    until nixos-enter --root /mnt -c "passwd $u"; do warn "Nochmal versuchen."; done
+  fi
 done
 
 if [[ $LOGIN_SHELL == zsh ]] && (( ! HOME_MANAGER )); then
@@ -2126,6 +2675,32 @@ if [[ $LOGIN_SHELL == zsh ]] && (( ! HOME_MANAGER )); then
     fi
     nixos-enter --root /mnt -c "chown $u:users /home/$u/.zshrc && chmod 644 /home/$u/.zshrc"
   done
+fi
+
+if (( WIFI_COPY )); then
+  info "Übernehme WLAN-Verbindungen"
+  for f in "${WIFI_FILES[@]}"; do
+    t="/mnt/etc/NetworkManager/system-connections/$(basename "$f")"
+    install -d -m 700 "${t%/*}"
+    # "nur für Benutzer nixos" (Live-System) entfernen, sonst gilt die Verbindung im neuen System für niemanden
+    ( umask 077; sed '/^permissions=/d' "$f" > "$t" )
+    echo "  $(sed -n 's/^ssid=//p' "$f" | head -n1)"
+    if ! grep -q '^psk=' "$f" && grep -q '^key-mgmt=wpa-psk' "$f"; then
+      echo "    (Passwort lag im Schlüsselbund, es wird beim ersten Verbinden abgefragt)"
+    fi
+  done
+fi
+
+if [[ $VPN == tailscale && -n ${TS_AUTHKEY-} ]]; then
+  install -d -m 700 /mnt/var/lib/tailscale
+  ( umask 077; printf '%s' "$TS_AUTHKEY" > /mnt/var/lib/tailscale/authkey )
+fi
+if [[ $VPN == wireguard ]]; then
+  install -d -m 700 /mnt/etc/wireguard
+  ( umask 077; printf '%s\n' "$WG_CONF_TEXT" > /mnt/etc/wireguard/wg0.conf )
+fi
+if [[ $DISK2_MODE == data ]]; then
+  nixos-enter --root /mnt -c "chown $NIX_USER:users /data"
 fi
 
 if (( BACKUP )); then
@@ -2143,6 +2718,7 @@ fi
 
 # Fragt bei einem fehlgeschlagenen Schritt mit Sicherheitsschlüssel nach; 0 = nochmal, 1 = überspringen
 key_retry() {
+  if (( AUTO_MODE )); then return 1; fi   # nicht endlos warten
   unset KEY_RETRY
   choose KEY_RETRY "$1 hat nicht geklappt. Wie weiter?" 1 \
     "again|Nochmal versuchen (Schlüssel eingesteckt?)" \
@@ -2151,12 +2727,14 @@ key_retry() {
 }
 
 if (( FIDO2_LUKS )); then
-  info "YubiKey/FIDO2 für die Verschlüsselung: Schlüssel einstecken. Erst das LUKS-Passwort, dann ggf. die PIN des Schlüssels, dann antippen"
-  until systemd-cryptenroll --fido2-device=auto "$ROOTPART" </dev/tty; do
-    if ! key_retry "Das Einrichten des Schlüssels für die Verschlüsselung"; then
-      FIDO2_LUKS_LATER=1
-      break
-    fi
+  info "YubiKey/FIDO2 für die Verschlüsselung: Schlüssel einstecken, ggf. die PIN des Schlüssels eingeben, dann antippen"
+  for dev in "$ROOTPART" ${D2PART:+"$D2PART"}; do
+    until PASSWORD="$LUKS_PASS" systemd-cryptenroll --fido2-device=auto "$dev" </dev/tty; do
+      if ! key_retry "Das Einrichten des Schlüssels für die Verschlüsselung"; then
+        FIDO2_LUKS_LATER=1
+        break
+      fi
+    done
   done
 fi
 
@@ -2182,7 +2760,15 @@ if [[ $SAMBA == server ]]; then
   info "Lege ~/Freigabe an und setze das Samba-Passwort für $NIX_USER"
   nixos-enter --root /mnt -c "install -d -m 700 -o $NIX_USER -g users /home/$NIX_USER/Freigabe"
   echo "  Das Samba-Passwort ist getrennt vom Login-Passwort, darf aber gleich sein."
-  if ! nixos-enter --root /mnt -c "mkdir -p /var/lib/samba/private /var/lock/samba /var/cache/samba /run/samba && smbpasswd -a $NIX_USER"; then
+  samba_cmd="mkdir -p /var/lib/samba/private /var/lock/samba /var/cache/samba /run/samba && smbpasswd -a $NIX_USER"
+  if [[ -n ${SAMBA_PASS-} ]]; then
+    samba_ok=1
+    printf '%s\n%s\n' "$SAMBA_PASS" "$SAMBA_PASS" | nixos-enter --root /mnt -c "${samba_cmd/smbpasswd -a/smbpasswd -s -a}" || samba_ok=0
+  else
+    samba_ok=1
+    nixos-enter --root /mnt -c "$samba_cmd" || samba_ok=0
+  fi
+  if (( ! samba_ok )); then
     warn "Samba-Passwort nicht gesetzt. Nach dem Start: sudo smbpasswd -a $NIX_USER"
   fi
 fi
@@ -2224,7 +2810,9 @@ if (( FINGERPRINT )); then
   echo "  Fingerabdruck einlernen: fprintd-enroll (oder Systemeinstellungen -> Benutzer)"
 fi
 if (( ${FIDO2_LUKS_LATER:-0} )); then
-  echo "  YubiKey für die Verschlüsselung später: sudo systemd-cryptenroll --fido2-device=auto /dev/disk/by-uuid/$LUKS_UUID"
+  for u in $LUKS_UUID $LUKS2_UUID; do
+    echo "  YubiKey für die Verschlüsselung später: sudo systemd-cryptenroll --fido2-device=auto /dev/disk/by-uuid/$u"
+  done
 fi
 if (( FIDO2_SUDO )) && [[ -z ${U2F_LINE-} ]]; then
   echo "  YubiKey für sudo später: mkdir -p ~/.config/Yubico && pamu2fcfg -o pam://$NIX_HOSTNAME -i pam://$NIX_HOSTNAME > ~/.config/Yubico/u2f_keys"
@@ -2239,17 +2827,35 @@ fi
 if [[ $HW_PROFILE != none ]]; then
   echo "  Hardware-Profil: nixos-hardware $HW_PROFILE (Updates mit: sudo nix-channel --update)"
 fi
+if [[ $INSTALL_MODE == dualboot ]]; then
+  echo "  Dual-Boot: systemd-boot startet als Erstes, $(if (( WINDOWS )); then echo "Windows steht im Bootmenü"; else echo "andere Systeme über das Bootmenü der Firmware"; fi)."
+  if (( WINDOWS )); then
+    echo "    Startet nach einem Windows-Update direkt Windows: im Firmware-Setup \"Linux Boot Manager\" wieder nach vorne."
+  fi
+fi
+if [[ $DISK2_MODE == raid1 ]]; then
+  echo "  RAID1: Fällt eine Platte aus, startet das System nicht von selbst. Dann vom Stick starten und mit"
+  echo "    'mount -o degraded' einhängen, Ersatz mit 'btrfs replace' einbauen."
+fi
+if [[ $VPN == tailscale && -z ${TS_AUTHKEY-} ]]; then
+  echo "  Tailscale anmelden: sudo tailscale up"
+fi
+if [[ $VPN == wireguard ]]; then
+  echo "  WireGuard wg0 startet automatisch; Status: sudo wg show"
+fi
 echo "  Antworten für weitere Installationen: /etc/nixos/install-antworten.env"
 if [[ $SAMBA == server ]]; then
   echo "  Samba-Freigabe: Windows \\\\$NIX_HOSTNAME\\freigabe, macOS/Linux smb://$NIX_HOSTNAME/freigabe"
 fi
 install -m 600 "$LOG" /mnt/var/log/nixos-install.log
 echo "  Protokoll gespeichert unter /var/log/nixos-install.log"
-unset REBOOT
+if (( ! AUTO_MODE )); then unset REBOOT; fi   # im Automatikmodus gilt REBOOT=j|n, Standard ja
 ask_yn REBOOT "Jetzt aushängen und neu starten?" j
 if (( REBOOT )); then
   umount -R /mnt
-  if (( ENCRYPT )); then cryptsetup close cryptroot; fi
+  for m in cryptdata cryptroot2 cryptroot; do
+    if [[ -e /dev/mapper/$m ]]; then cryptsetup close "$m"; fi
+  done
   reboot
 else
   echo "System bleibt unter /mnt eingehängt. Später: umount -R /mnt && reboot"
