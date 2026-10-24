@@ -24,14 +24,18 @@
 #   CONTAINERS   none | podman | docker
 #   BACKUP_REPO  restic-Ziel, z. B. sftp:benutzer@nas:/backup/rechner
 #   LID          suspend | hibernate (Standby, nach 1 h Ruhezustand) | ignore
+#   HW_PROFILE   nixos-hardware-Profil, z. B. lenovo/thinkpad/t480, oder none
 #   LOGIN_SHELL  bash | zsh
 #   SSH_KEYS     öffentlicher Schlüssel oder gh:<GitHub-Name>
+#   GIT_NAME, GIT_EMAIL  Git-Identität (nur mit home-manager)
 #   EXTRA_USERS  weitere Benutzer, durch Leerzeichen getrennt
 #   NIX_HOSTNAME, NIX_USER, SWAP_GB
 #   Ja/Nein (j/n): PRINTING BLUETOOTH STEAM LIBVIRT FLATPAK UNFREE ENCRYPT UKI TPM2 SILENT
-#                  SNAPPER BACKUP HIBERNATE AUTOUPDATE OHMYZSH SSHD NV_OPEN
+#                  SNAPPER BACKUP HIBERNATE AUTOUPDATE OHMYZSH SSHD NV_OPEN FINGERPRINT
+#                  FIDO2_LUKS FIDO2_SUDO RESCUE HOME_MANAGER
 # Ohne Abfrage, nur per Variable: ESP_GB (1), COMPRESS (zstd), ZRAM (j),
-#   KERNEL (latest = neuester stabiler Kernel | lts = Standard-Kernel des Releases)
+#   KERNEL (latest = neuester stabiler Kernel | lts = Standard-Kernel des Releases),
+#   TUI (j = Menüs mit dialog, n = reine Textabfragen)
 #
 # Das komplette Protokoll landet in /var/log/nixos-install.log des neuen Systems.
 
@@ -52,34 +56,146 @@ die() {
 trap 'die "Abbruch in Zeile $LINENO: $BASH_COMMAND"' ERR
 
 is_yes() { [[ ${1,,} =~ ^(j|ja|y|yes|1)$ ]]; }
+yn() { if (( $1 )); then echo ja; else echo nein; fi; }
 
-# ask VAR "Frage" "Standard" – Freitext, nur wenn VAR noch leer ist
+# ---------- Oberfläche: dialog-Menüs, sonst Textabfragen ----------
+USE_DIALOG=0; DIALOG_BIN=""; WIPED=0
+USB_DIR=${USB_DIR:-/sys/bus/usb/devices}
+
+# dialog zeichnet auf dem Terminal, das Ergebnis kommt über fd 3 zurück
+dlg() {
+  local out rc=0
+  out=$(LANG=${LANG:-C.UTF-8} "$DIALOG_BIN" --backtitle "NixOS-Installer" --output-fd 3 "$@" \
+        3>&1 1>/dev/tty 2>/dev/tty </dev/tty) || rc=$?
+  printf '%s' "$out"
+  return "$rc"
+}
+
+# Abbrechen/Esc in einem Menü
+dlg_abort() {
+  clear >/dev/tty 2>/dev/null || true
+  if (( WIPED )); then die "Abgebrochen. Das neue System ist unter /mnt eingehängt."; fi
+  die "Abgebrochen, nichts verändert."
+}
+
+# Hinweis während der Fragen: im Menü als Meldung, sonst als Warnung
+note() {
+  if (( USE_DIALOG )); then
+    dlg --title "Hinweis" --msgbox "$*" 0 0 || true
+    echo "  Hinweis: $*"
+  else
+    warn "$*"
+  fi
+}
+
+# ask VAR "Frage" "Standard" ["Regex" "Fehlertext"] – Freitext, nur wenn VAR noch nicht gesetzt ist
 ask() {
-  local var=$1 prompt=$2 def=${3-} val
-  if [[ -n ${!var+x} ]]; then return 0; fi   # vorbelegt (auch leer) = schon beantwortet
-  read -rp "$prompt${def:+ [$def]}: " val
-  val=${val:-$def}
+  local var=$1 prompt=$2 def=${3-} re=${4-} msg=${5:-Ungültige Eingabe.} val
+  if [[ -n ${!var+x} ]]; then   # vorbelegt (auch leer) = schon beantwortet
+    if [[ -n $re && ! ${!var} =~ $re ]]; then die "$var: $msg (${!var})"; fi
+    return 0
+  fi
+  while true; do
+    if (( USE_DIALOG )); then
+      val=$(dlg --title "Eingabe" --inputbox "$prompt" 0 0 "$def") || dlg_abort
+    else
+      read -rp "$prompt${def:+ [$def]}: " val
+      val=${val:-$def}
+    fi
+    if [[ -z $re || $val =~ $re ]]; then break; fi
+    if (( ! USE_DIALOG )) && [[ ! -t 0 ]]; then die "$msg ($val)"; fi   # nicht interaktiv: nicht endlos fragen
+    note "$msg"
+  done
   printf -v "$var" '%s' "$val"
+  if (( USE_DIALOG )); then echo "  $prompt: $val"; fi
 }
 
 # ask_yn VAR "Frage" j|n – setzt VAR auf 1 oder 0
 ask_yn() {
-  local var=$1 prompt=$2 def=$3 val hint
+  local var=$1 prompt=$2 def=$3 val hint rc
   val=${!var-}
   if [[ -z $val ]]; then
-    if [[ $def == j ]]; then hint="J/n"; else hint="j/N"; fi
-    read -rp "$prompt [$hint]: " val
-    val=${val:-$def}
+    if (( USE_DIALOG )); then
+      rc=0
+      if [[ $def == j ]]; then
+        dlg --yes-label "Ja" --no-label "Nein" --yesno "$prompt" 0 0 || rc=$?
+      else
+        dlg --yes-label "Ja" --no-label "Nein" --defaultno --yesno "$prompt" 0 0 || rc=$?
+      fi
+      case $rc in 0) val=j ;; 1) val=n ;; *) dlg_abort ;; esac
+      echo "  $prompt -> $(if [[ $val == j ]]; then echo ja; else echo nein; fi)"
+    else
+      if [[ $def == j ]]; then hint="J/n"; else hint="j/N"; fi
+      read -rp "$prompt [$hint]: " val
+      val=${val:-$def}
+    fi
   fi
   if is_yes "$val"; then printf -v "$var" 1; else printf -v "$var" 0; fi
 }
 
-# choose VAR "Frage" Standardnummer "wert|Beschreibung" ... – nummeriertes Menü
+# ask_multi "Titel" VAR "Text" j|n ... – im Menü eine Checkliste, sonst einzelne Ja/Nein-Fragen
+ask_multi() {
+  local title=$1 i var st sel
+  shift
+  local args=("$@") open=() items=()
+  for ((i = 0; i < ${#args[@]}; i += 3)); do
+    var=${args[i]}
+    if [[ -n ${!var-} ]]; then
+      if is_yes "${!var}"; then printf -v "$var" 1; else printf -v "$var" 0; fi
+    else
+      open+=("$i")
+    fi
+  done
+  if (( ${#open[@]} == 0 )); then return 0; fi
+  if (( USE_DIALOG )); then
+    for i in "${open[@]}"; do
+      if [[ ${args[i+2]} == j ]]; then st=on; else st=off; fi
+      items+=("${args[i]}" "${args[i+1]}" "$st")
+    done
+    sel=$(dlg --title "$title" --no-tags --separate-output \
+              --checklist "Leertaste wählt aus oder ab, Enter bestätigt." 0 0 0 "${items[@]}") || dlg_abort
+    for i in "${open[@]}"; do
+      var=${args[i]}
+      if grep -qx "$var" <<<"$sel"; then printf -v "$var" 1; else printf -v "$var" 0; fi
+      echo "  ${args[i+1]}: $(yn "${!var}")"
+    done
+  else
+    printf '\n%s\n' "$title"
+    for i in "${open[@]}"; do ask_yn "${args[i]}" "${args[i+1]}?" "${args[i+2]}"; done
+  fi
+}
+
+# ask_pass VAR "Frage" – Passwort zweimal ohne Echo; landet nicht im Protokoll
+ask_pass() {
+  local var=$1 prompt=$2 p1 p2
+  while true; do
+    if (( USE_DIALOG )); then
+      p1=$(dlg --insecure --passwordbox "$prompt" 0 0) || dlg_abort
+      p2=$(dlg --insecure --passwordbox "Passwort wiederholen" 0 0) || dlg_abort
+    else
+      read -rsp "$prompt: " p1; echo
+      read -rsp "Passwort wiederholen: " p2; echo
+    fi
+    if [[ -n $p1 && $p1 == "$p2" ]]; then break; fi
+    if (( ! USE_DIALOG )) && [[ ! -t 0 ]]; then die "Passwörter leer oder nicht gleich."; fi
+    note "Leer oder nicht gleich, bitte nochmal."
+  done
+  printf -v "$var" '%s' "$p1"
+}
+
+# choose VAR "Frage" Standardnummer "wert|Beschreibung" ... – Auswahlmenü
 choose() {
   local var=$1 prompt=$2 def=$3 i sel
   shift 3
-  local opts=("$@")
+  local opts=("$@") items=()
   [[ -n ${!var-} ]] && return 0
+  if (( USE_DIALOG )); then
+    for i in "${!opts[@]}"; do items+=("${opts[i]%%|*}" "${opts[i]#*|}"); done
+    sel=$(dlg --no-tags --default-item "${opts[def - 1]%%|*}" --menu "$prompt" 0 0 0 "${items[@]}") || dlg_abort
+    printf -v "$var" '%s' "$sel"
+    echo "  $prompt -> $sel"
+    return 0
+  fi
   printf '\n%s\n' "$prompt"
   for i in "${!opts[@]}"; do
     printf '  %2d) %s\n' "$((i + 1))" "${opts[i]#*|}"
@@ -91,6 +207,144 @@ choose() {
     warn "Bitte eine Zahl von 1 bis ${#opts[@]} eingeben."
   done
   printf -v "$var" '%s' "${opts[sel - 1]%%|*}"
+}
+
+# Zusätzlichen Kanal einrichten und laden (z. B. nixos-hardware, home-manager)
+add_channel() {
+  local name=$1 url=$2
+  if [[ " ${CHANNELS_DONE-} " == *" $name "* ]]; then return 0; fi
+  if (( USE_DIALOG )); then dlg --infobox "Lade $name ..." 3 50 || true; fi
+  echo "  Lade Kanal $name ($url)"
+  if nix-channel --add "$url" "$name" && nix-channel --update "$name" >/dev/null; then
+    CHANNELS_DONE="${CHANNELS_DONE-} $name"
+    return 0
+  fi
+  nix-channel --remove "$name" >/dev/null 2>&1 || true
+  return 1
+}
+
+# Fingerabdruckleser über die Geräteliste von libfprint erkennen
+# setzt FP_DEV (vendor:product) und FP_STATUS (supported | unsupported | leer)
+detect_fingerprint() {
+  local lf hwdb d id st
+  FP_DEV=""; FP_STATUS=""
+  ls "$USB_DIR"/*/idVendor >/dev/null 2>&1 || return 0
+  if (( USE_DIALOG )); then dlg --infobox "Suche Fingerabdruckleser ..." 3 50 || true; fi
+  lf=$(nix-build '<nixpkgs>' -A libfprint --no-out-link 2>/dev/null) || return 0
+  hwdb=$lf/lib/udev/hwdb.d/60-autosuspend-libfprint-2.hwdb
+  [[ -r $hwdb ]] || return 0
+  for d in "$USB_DIR"/*; do
+    [[ -r $d/idVendor && -r $d/idProduct ]] || continue
+    id="usb:v$(tr 'a-f' 'A-F' <"$d/idVendor")p$(tr 'a-f' 'A-F' <"$d/idProduct")*"
+    st=$(awk -v id="$id" '/^# Known unsupported/ { u = 1 } /^# Supported by/ { u = 0 }
+                          $0 == id { print (u ? "unsupported" : "supported"); exit }' "$hwdb")
+    if [[ -n $st ]]; then
+      FP_DEV="$(<"$d/idVendor"):$(<"$d/idProduct")"
+      FP_STATUS=$st
+      if [[ $st == supported ]]; then return 0; fi
+    fi
+  done
+}
+
+# hw_candidates "<DMI-Text>" README.md – gibt "Punkte<TAB>Treffer<TAB>Pfad<TAB>Name" aus, beste zuerst
+hw_candidates() {
+  local dmi=$1 readme=$2
+  awk -v dmi="$dmi" '
+    function toks(s, arr,   n, i, t, k, parts, m, j) {
+      s = tolower(s); gsub(/[^a-z0-9]+/, " ", s)
+      n = split(s, parts, " "); k = 0
+      for (i = 1; i <= n; i++) if (parts[i] != "") arr[++k] = parts[i]
+      return k
+    }
+    # Teile an Buchstabe/Ziffer-Grenzen: t480s -> t 480 s
+    function pieces(w, arr,   k, cur, c, i, cls, prev) {
+      k = 0; cur = ""; prev = ""
+      for (i = 1; i <= length(w); i++) {
+        c = substr(w, i, 1); cls = (c ~ /[0-9]/) ? "d" : "a"
+        if (cur != "" && cls != prev) { arr[++k] = cur; cur = "" }
+        cur = cur c; prev = cls
+      }
+      if (cur != "") arr[++k] = cur
+      return k
+    }
+    BEGIN {
+      d = tolower(dmi)
+      if (d ~ /asustek/) d = d " asus"
+      if (d ~ /micro-star/) d = d " msi"
+      if (d ~ /hewlett/) d = d " hp"
+      n = toks(d, w)
+      for (i = 1; i <= n; i++) {
+        # Seriennummern-artige Codes (z. B. 20L5CTO1WW) liefern nur Zufallstreffer
+        if (length(w[i]) >= 8 && w[i] ~ /[a-z]/ && w[i] ~ /[0-9]/) continue
+        have[w[i]] = 1; m = pieces(w[i], p); for (j = 1; j <= m; j++) have[p[j]] = 1
+      }
+    }
+    /^\| \[.*\]\(.*\) *\| *`<nixos-hardware\// {
+      name = $0; sub(/^\| \[/, "", name); sub(/\]\(.*/, "", name); gsub(/\\/, "", name)
+      path = $0; sub(/.*`<nixos-hardware\//, "", path); sub(/\/?>`.*/, "", path)
+      if (seen[path]++) next
+      n = toks(name, t); hit = 0
+      for (i = 1; i <= n; i++) {
+        if (t[i] in have) { hit++; continue }
+        m = pieces(t[i], p); ok = (m > 1)
+        for (j = 1; j <= m; j++) if (!(p[j] in have)) ok = 0
+        if (ok) hit += 0.9   # nur in Teilen getroffen (GA401 in GA401QM): etwas schwächer
+      }
+      if (n > 0 && hit / n >= 0.75) printf "%.3f\t%d\t%s\t%s\n", hit / n, n, path, name
+    }
+  ' "$readme" | sort -t$'\t' -k1,1nr -k2,2nr
+}
+
+# home.nix für home-manager; $1 = Zieldatei
+write_home_nix() {
+  {
+    cat <<EOF
+# Benutzer-Einstellungen, verwaltet von home-manager (gilt für alle Benutzer).
+# Persönliches pro Benutzer (z. B. Git-Name) steht in configuration.nix unter home-manager.users.
+# Nach Änderungen: sudo nixos-rebuild switch
+{ config, pkgs, ... }:
+{
+  home.stateVersion = "$STATE_VERSION";  # nicht ändern
+
+  home.shellAliases = {
+    rebuild = "sudo nixos-rebuild switch";
+    update = "sudo nixos-rebuild switch --upgrade";
+  };
+EOF
+    if [[ $LOGIN_SHELL == zsh ]]; then
+      cat <<'EOF'
+
+  programs.zsh = {
+    enable = true;
+    autosuggestion.enable = true;      # Vorschläge aus dem Verlauf, Pfeil rechts übernimmt
+    syntaxHighlighting.enable = true;
+    history = {
+      size = 10000;
+      ignoreDups = true;
+    };
+EOF
+      if (( OHMYZSH )); then
+        cat <<'EOF'
+    oh-my-zsh = {
+      enable = true;
+      theme = "robbyrussell";          # Auswahl: ls $(nix-build '<nixpkgs>' -A oh-my-zsh)/share/oh-my-zsh/themes
+      plugins = [ "git" "sudo" "colored-man-pages" ];
+    };
+EOF
+      fi
+      echo '  };'
+    else
+      printf '\n  programs.bash.enable = true;\n'
+    fi
+    cat <<'EOF'
+
+  programs.git.enable = true;
+
+  # Programme nur für die Benutzer, z. B.:
+  # home.packages = with pkgs; [ thunderbird ];
+}
+EOF
+  } > "$1"
 }
 
 # emit "Überschrift" "Nix-Text" – schreibt einen Konfigurationsblock, wenn er nicht leer ist
@@ -262,7 +516,9 @@ reread_partitions() {
 ANSWER_VARS=(CHANNEL KB LOCALE TIMEZONE DESKTOP DESKTOP_MODE GPU NV_OPEN KERNEL PRINTING BLUETOOTH
   STEAM SAMBA LIBVIRT CONTAINERS FLATPAK UNFREE ENCRYPT UKI TPM2 SILENT SNAPPER BACKUP BACKUP_REPO
   HIBERNATE LID AUTOUPDATE LOGIN_SHELL OHMYZSH SSHD SSH_KEYS NIX_HOSTNAME NIX_USER EXTRA_USERS
-  SWAP_GB ZRAM ESP_GB COMPRESS)
+  SWAP_GB ZRAM ESP_GB COMPRESS FINGERPRINT FIDO2_LUKS FIDO2_SUDO RESCUE HOME_MANAGER GIT_NAME
+  GIT_EMAIL)
+# Nicht gespeichert, weil rechnerspezifisch: DISK, HW_PROFILE
 
 # Liest nur Zeilen der Form NAME='wert' mit bekannten Namen; nichts davon wird ausgeführt.
 # Per Umgebungsvariable gesetzte Werte haben Vorrang.
@@ -328,6 +584,10 @@ write_mock_hw() {
 build_config() {
   local CFG=$1
 # --- Bausteine ---
+IMPORTS='    ./hardware-configuration.nix'
+if (( UKI )); then IMPORTS+=$'\n    lanzaboote.nixosModules.lanzaboote'; fi
+if [[ $HW_PROFILE != none ]]; then IMPORTS+=$'\n    <nixos-hardware/'"$HW_PROFILE"'>  # Anpassungen für dieses Modell (nixos-hardware)'; fi
+if (( HOME_MANAGER )); then IMPORTS+=$'\n    <home-manager/nixos>'; fi
 if (( UKI )); then
   HEADER_NIX='{ config, lib, pkgs, ... }:
 let
@@ -337,11 +597,7 @@ let
     sha256 = "0syvqpi77ia1vd189658g53mqjgw7i39zym2r0g7asdjkrz0mgmj";
   }) { inherit pkgs; };
 in
-{
-  imports = [
-    ./hardware-configuration.nix
-    lanzaboote.nixosModules.lanzaboote
-  ];'
+{'
   BOOT_NIX='  boot.loader.systemd-boot.enable = lib.mkForce false;  # lanzaboote ersetzt systemd-boot
   boot.loader.systemd-boot.configurationLimit = 10;     # gilt auch für lanzaboote
   boot.loader.efi.canTouchEfiVariables = true;
@@ -351,12 +607,17 @@ in
   };'
 else
   HEADER_NIX='{ config, lib, pkgs, ... }:
-{
-  imports = [ ./hardware-configuration.nix ];'
+{'
   BOOT_NIX='  boot.loader.systemd-boot.enable = true;
   boot.loader.systemd-boot.configurationLimit = 10;  # ESP nicht volllaufen lassen
   boot.loader.efi.canTouchEfiVariables = true;'
+  if (( RESCUE )); then
+    BOOT_NIX+='
+  boot.loader.systemd-boot.memtest86.enable = true;   # Eintrag „Memtest86+“: Arbeitsspeicher testen
+  boot.loader.systemd-boot.netbootxyz.enable = true;  # Eintrag „netboot.xyz“: Rettungssysteme aus dem Netz'
+  fi
 fi
+HEADER_NIX+=$'\n  imports = [\n'"$IMPORTS"$'\n  ];'
 
 KERNEL_NIX="  boot.kernelPackages = pkgs.$KERNEL_ATTR;"
 if [[ $KERNEL == latest ]]; then KERNEL_NIX+="  # neuester stabiler Kernel"; fi
@@ -383,8 +644,18 @@ fi
 if (( TPM2 )); then
   LUKS_NIX+='
   # TPM2: entsperrt ohne Passwort, sobald "sudo luks-tpm2-enroll" gelaufen ist (nach Secure Boot)
-  security.tpm2.enable = true;
+  security.tpm2.enable = true;'
+fi
+if (( TPM2 && FIDO2_LUKS )); then
+  LUKS_NIX+='
+  # TPM2 und FIDO2: ohne feste Vorgabe probiert systemd alle eingerichteten Schlüssel, dann das Passwort'
+elif (( TPM2 )); then
+  LUKS_NIX+='
   boot.initrd.luks.devices."cryptroot".crypttabExtraOpts = [ "tpm2-device=auto" ];'
+elif (( FIDO2_LUKS )); then
+  LUKS_NIX+='
+  # FIDO2: beim Start Schlüssel einstecken (ggf. PIN) und antippen; das Passwort geht weiterhin
+  boot.initrd.luks.devices."cryptroot".crypttabExtraOpts = [ "fido2-device=auto" ];'
 fi
 
 FS_NIX="  fileSystems = {
@@ -504,19 +775,21 @@ if [[ $GPU != none ]]; then
     GPU_NIX+='
   hardware.amdgpu.initrd.enable = true;  # Grafik früh laden, sauberer Startbildschirm'
   fi
+  # Mit Hardware-Profil gelten dessen NVIDIA-Werte; unsere greifen nur, wo es nichts vorgibt
+  if [[ $HW_PROFILE != none ]]; then W='lib.mkOverride 1100 '; else W=''; fi
   if [[ $GPU == nvidia || $GPU == nvidia-prime ]]; then
     if (( NV_OPEN )); then nvopen=true; else nvopen=false; fi
     GPU_NIX+="
   services.xserver.videoDrivers = [ \"nvidia\" ];
   hardware.nvidia = {
     modesetting.enable = true;
-    open = $nvopen;          # offene Kernelmodule, ab GTX 16xx/RTX 20xx
+    open = $W$nvopen;          # offene Kernelmodule, ab GTX 16xx/RTX 20xx
     nvidiaSettings = true;"
     if (( ! NV_OPEN )); then
       GPU_NIX+="
     # Treiber 580 ist der letzte für GTX 9xx/10xx (Maxwell, Pascal, Volta);
     # noch ältere Karten brauchen legacy_470 oder nouveau
-    package = config.boot.kernelPackages.nvidiaPackages.legacy_580;"
+    package = ${W}config.boot.kernelPackages.nvidiaPackages.legacy_580;"
     fi
     GPU_NIX+="
   };"
@@ -525,10 +798,10 @@ if [[ $GPU != none ]]; then
     if [[ $IGPU_VENDOR == intel ]]; then igpu_opt=intelBusId; else igpu_opt=amdgpuBusId; fi
     GPU_NIX+="
   hardware.nvidia.prime = {
-    offload.enable = true;
-    offload.enableOffloadCmd = true;  # Programme mit \"nvidia-offload <programm>\" auf der NVIDIA-GPU starten
-    $igpu_opt = \"$(pci_busid "$IGPU_DEV")\";
-    nvidiaBusId = \"$(pci_busid "$NV_DEV")\";
+    offload.enable = ${W}true;
+    offload.enableOffloadCmd = ${W}true;  # Programme mit \"nvidia-offload <programm>\" auf der NVIDIA-GPU starten
+    $igpu_opt = $W\"$(pci_busid "$IGPU_DEV")\";
+    nvidiaBusId = $W\"$(pci_busid "$NV_DEV")\";
   };"
   fi
 fi
@@ -629,7 +902,14 @@ fi
 # Programme mit eigener NixOS-Einbindung
 PROGRAMS_NIX='  programs.direnv.enable = true;  # Projektumgebungen, inkl. nix-direnv
   programs.mtr.enable = true;     # mtr ohne root
-  programs.nh.enable = true;      # nh os switch -f "<nixpkgs/nixos>", nh search, nh clean'
+  programs.nh = {
+    enable = true;                # nh os switch -f "<nixpkgs/nixos>", nh search
+    clean = {
+      enable = true;              # alte Generationen und Pakete wöchentlich aufräumen
+      dates = "weekly";
+      extraArgs = "--keep 10 --keep-since 30d";
+    };
+  };'
 
 # Minimal: Standard-Apps weglassen, Terminal, Dateimanager und Editor bleiben
 DESKTOP_PKGS=""
@@ -697,11 +977,6 @@ if (( AUTOUPDATE )); then
     dates = "04:00";
     randomizedDelaySec = "45min";
     allowReboot = false;  # neuer Kernel greift beim nächsten Neustart
-  };
-  nix.gc = {
-    automatic = true;
-    dates = "weekly";
-    options = "--delete-older-than 30d";
   };'
 fi
 
@@ -710,7 +985,19 @@ USER_SHELL=""
 if [[ $LOGIN_SHELL == zsh ]]; then
   USER_SHELL='
     shell = pkgs.zsh;'
-  if (( OHMYZSH )); then
+  if (( HOME_MANAGER )); then
+    # zsh-Einstellungen kommen aus home.nix (home-manager)
+    SHELL_NIX='  programs.zsh = {
+    enable = true;
+    enableGlobalCompInit = false;  # compinit übernimmt home-manager in ~/.zshrc'
+    if (( OHMYZSH )); then
+      SHELL_NIX+='
+    promptInit = "";               # Prompt kommt vom oh-my-zsh-Theme'
+    fi
+    SHELL_NIX+='
+  };
+  environment.pathsToLink = [ "/share/zsh" ];  # Vervollständigung für Systempakete'
+  elif (( OHMYZSH )); then
     # oh-my-zsh wird in ~/.zshrc geladen (vom Installer angelegt), nicht in /etc/zshrc
     SHELL_NIX='  programs.zsh = {
     enable = true;
@@ -748,6 +1035,63 @@ for u in $EXTRA_USERS; do
     extraGroups = [ \"networkmanager\" \"audio\" ];$USER_SHELL
   };"
 done
+
+# Fingerabdruck
+FP_NIX=""
+if (( FINGERPRINT )) || [[ $HW_PROFILE != none ]]; then
+  if (( FINGERPRINT )); then
+    FP_NIX='  services.fprintd.enable = true;  # Finger einlernen: fprintd-enroll oder in den Systemeinstellungen
+'
+  fi
+  FP_NIX+='  # Konsole und Anmeldebildschirm nur mit Passwort, sonst blockiert das Warten auf den Finger
+  # die Passworteingabe; sudo, Admin-Abfragen und Sperrbildschirm nehmen den Finger
+  security.pam.services.login.fprintAuth = false;'
+  case $DESKTOP in
+    plasma)        FP_NIX+=$'\n  security.pam.services.sddm.fprintAuth = false;' ;;
+    xfce|cinnamon) FP_NIX+=$'\n  security.pam.services.lightdm.fprintAuth = false;' ;;
+    cosmic)        FP_NIX+=$'\n  security.pam.services.greetd.fprintAuth = false;' ;;
+  esac
+fi
+
+# YubiKey/FIDO2 für sudo
+U2F_NIX=""
+if (( FIDO2_SUDO )); then
+  U2F_NIX="  security.pam.u2f = {
+    control = \"sufficient\";  # Schlüssel antippen genügt, sonst Passwort
+    settings = {
+      cue = true;            # Hinweis \"Please touch the device\" anzeigen
+      origin = \"pam://$NIX_HOSTNAME\";
+      appid = \"pam://$NIX_HOSTNAME\";
+    };
+  };
+  security.pam.services.sudo.u2f.enable = true;  # Schlüssel: ~/.config/Yubico/u2f_keys (pamu2fcfg)"
+  if [[ $DESKTOP != none ]]; then
+    U2F_NIX+=$'\n  security.pam.services.polkit-1.u2f.enable = true;  # grafische Admin-Abfragen'
+  fi
+fi
+
+# home-manager
+HM_NIX=""
+if (( HOME_MANAGER )); then
+  HM_NIX='  home-manager = {
+    useGlobalPkgs = true;
+    useUserPackages = true;
+    backupFileExtension = "vor-home-manager";  # vorhandene Dateien umbenennen statt abbrechen'
+  if [[ -n $GIT_NAME || -n $GIT_EMAIL ]]; then
+    HM_NIX+="
+    users.\"$NIX_USER\" = {
+      imports = [ ./home.nix ];
+      programs.git.settings.user = {"
+    if [[ -n $GIT_NAME ]]; then HM_NIX+=$'\n        name = "'"$GIT_NAME"'";'; fi
+    if [[ -n $GIT_EMAIL ]]; then HM_NIX+=$'\n        email = "'"$GIT_EMAIL"'";'; fi
+    HM_NIX+=$'\n      };\n    };'
+  else
+    HM_NIX+=$'\n    users."'"$NIX_USER"'".imports = [ ./home.nix ];'
+  fi
+  for u in $EXTRA_USERS; do HM_NIX+=$'\n    users."'"$u"'".imports = [ ./home.nix ];'; done
+  HM_NIX+=$'\n  };'
+  write_home_nix "$(dirname "$CFG")/home.nix"
+fi
 
 FLATPAK_NIX=""
 if (( FLATPAK )); then
@@ -945,7 +1289,7 @@ if (( TPM2 )); then
     # LUKS an TPM2 binden (PCR 7 = Secure-Boot-Zustand), erst nach dem Aktivieren von Secure Boot
     (writeShellScriptBin \"luks-tpm2-enroll\" \"exec \${systemd}/bin/systemd-cryptenroll --wipe-slot=tpm2 --tpm2-device=auto --tpm2-pcrs=7 /dev/disk/by-uuid/$LUKS_UUID\")"
 fi
-if [[ $LOGIN_SHELL == zsh ]] && (( OHMYZSH )); then
+if [[ $LOGIN_SHELL == zsh ]] && (( OHMYZSH && ! HOME_MANAGER )); then
   PKG_NIX+='
     # zsh: oh-my-zsh und Plugins, geladen in ~/.zshrc
     oh-my-zsh
@@ -991,6 +1335,9 @@ PKG_NIX+='
   emit "Unfreie Pakete"                      "$UNFREE_NIX"
   emit "Automatische Updates"                "$UPDATE_NIX"
   emit "Shell"                               "$SHELL_NIX"
+  emit "Fingerabdruck"                       "$FP_NIX"
+  emit "YubiKey/FIDO2 für sudo"              "$U2F_NIX"
+  emit "home-manager: Benutzer-Einstellungen in home.nix" "$HM_NIX"
   emit "SSH"                                 "$SSH_NIX"
   emit "Programme"                           "$PROGRAMS_NIX"
   emit "Benutzer"                            "$USER_NIX"
@@ -1043,6 +1390,13 @@ done
 if grep -q GenuineIntel /proc/cpuinfo; then CPU_INTEL=1; else CPU_INTEL=0; fi
 if systemd-detect-virt -q 2>/dev/null; then IS_VM=1; else IS_VM=0; fi
 LUKS_UUID=""; RESUME_UUID=""; RESUME_OFFSET=0; AVAHI_SETTINGS=0
+
+# Menüs mit dialog, wenn ein Terminal da ist (TUI=n schaltet sie ab)
+if [[ ${TUI:-j} != [nN]* && -t 0 ]] && [[ -r /dev/tty ]]; then
+  echo "  Lade dialog für die Menüs ..."
+  DIALOG_BIN=$(nix-build '<nixpkgs>' -A dialog --no-out-link 2>/dev/null)/bin/dialog || true
+  if [[ -x $DIALOG_BIN ]]; then USE_DIALOG=1; else warn "dialog nicht verfügbar, frage im Textmodus."; fi
+fi
 
 # =====================================================================
 #  Abfragen
@@ -1120,7 +1474,7 @@ if [[ $(tty 2>/dev/null) == /dev/tty* ]]; then
     at:*)          km=de ;;
     *)             km=$XKB_LAYOUT ;;
   esac
-  loadkeys "$km" >/dev/null 2>&1 || warn "Konsolen-Layout '$km' nicht gefunden, gilt erst im neuen System."
+  loadkeys "$km" >/dev/null 2>&1 || note "Konsolen-Layout '$km' nicht gefunden, gilt erst im neuen System."
 fi
 
 # ---------- 3. Sprache ----------
@@ -1143,8 +1497,8 @@ FORMAT_LOCALE=""
 [[ $LOCALE == *+* ]] && FORMAT_LOCALE=${LOCALE#*+}
 
 # ---------- Zeitzone ----------
-ask TIMEZONE "Zeitzone (z. B. Europe/Berlin, Europe/Vienna, Europe/Zurich)" "Europe/Berlin"
-[[ $TIMEZONE =~ ^[A-Za-z_]+(/[A-Za-z0-9_+-]+)*$ ]] || die "Ungültige Zeitzone: $TIMEZONE"
+ask TIMEZONE "Zeitzone (z. B. Europe/Berlin, Europe/Vienna, Europe/Zurich)" "Europe/Berlin" \
+  '^[A-Za-z_]+(/[A-Za-z0-9_+-]+)*$' "Ungültige Zeitzone, Form: Kontinent/Stadt"
 if [[ -d /etc/zoneinfo && ! -f /etc/zoneinfo/$TIMEZONE ]]; then die "Unbekannte Zeitzone: $TIMEZONE"; fi
 
 # ---------- 4. Desktop ----------
@@ -1205,19 +1559,69 @@ if [[ $GPU == nvidia* ]]; then
     if (( NV_LTS )); then KERNEL=lts; fi
   fi
   if [[ $GPU == nvidia-prime && ( -z $NV_DEV || -z $IGPU_DEV ) ]]; then
-    warn "Für PRIME wurden nicht beide GPUs gefunden, nehme den normalen NVIDIA-Treiber."
+    note "Für PRIME wurden nicht beide GPUs gefunden, nehme den normalen NVIDIA-Treiber."
     GPU=nvidia
   fi
 fi
 
+# ---------- Hardware-Profil (nixos-hardware) ----------
+NH_DIR=${NH_DIR:-/nix/var/nix/profiles/per-user/root/channels/nixos-hardware}
+DMI_DIR=${DMI_DIR:-/sys/class/dmi/id}
+NH_URL=https://github.com/NixOS/nixos-hardware/archive/master.tar.gz
+HW_MODEL=$(cat "$DMI_DIR"/sys_vendor "$DMI_DIR"/product_version "$DMI_DIR"/product_name 2>/dev/null | tr '\n' ' ' | tr -s ' ' || true)
+if [[ -z ${HW_PROFILE-} ]]; then
+  HW_PROFILE=none
+  if (( ! IS_VM )) && [[ -n ${HW_MODEL// } ]] && add_channel nixos-hardware "$NH_URL" && [[ -r $NH_DIR/README.md ]]; then
+    dmi=$HW_MODEL$(cat "$DMI_DIR"/product_family "$DMI_DIR"/board_name 2>/dev/null | tr '\n' ' ' || true)
+    HW_OPTS=(); hw_top=0
+    while IFS=$'\t' read -r score _ path name; do
+      if (( ${#HW_OPTS[@]} == 0 )); then hw_top=$score; fi
+      HW_OPTS+=("$path|$name ($path)")
+    done < <(hw_candidates "$dmi" "$NH_DIR/README.md" | head -n 6)
+    if (( ${#HW_OPTS[@]} > 0 )); then
+      HW_OPTS+=("none|Kein Profil" "custom|Anderes Profil (Pfad aus nixos-hardware eingeben)")
+      # Vorschlag nur bei eindeutigem Treffer, sonst „Kein Profil“
+      if awk -v s="$hw_top" 'BEGIN { exit !(s >= 0.95) }'; then hdef=1; else hdef=$(( ${#HW_OPTS[@]} - 1 )); fi
+      unset HW_PROFILE
+      choose HW_PROFILE "Hardware-Profil aus nixos-hardware für ${HW_MODEL}? (Anpassungen speziell für dieses Modell)" "$hdef" "${HW_OPTS[@]}"
+      if [[ $HW_PROFILE == custom ]]; then
+        unset HW_PROFILE
+        ask HW_PROFILE "Profil-Pfad, z. B. lenovo/thinkpad/t480 (Liste: github.com/NixOS/nixos-hardware)" "" \
+          '^[a-z0-9][a-z0-9/_.-]*$' "Ungültiger Pfad"
+      fi
+    fi
+  fi
+fi
+if [[ $HW_PROFILE != none ]]; then
+  add_channel nixos-hardware "$NH_URL" || die "nixos-hardware ist nicht erreichbar. Netzwerk prüfen oder HW_PROFILE=none setzen."
+  [[ -f $NH_DIR/$HW_PROFILE/default.nix ]] || die "Unbekanntes nixos-hardware-Profil: $HW_PROFILE"
+fi
+
+# ---------- Fingerabdruckleser ----------
+if [[ -z ${FINGERPRINT-} ]]; then
+  FINGERPRINT=0
+  if (( ! IS_VM )); then
+    detect_fingerprint
+    case $FP_STATUS in
+      supported)
+        unset FINGERPRINT
+        ask_yn FINGERPRINT "Fingerabdruckleser erkannt ($FP_DEV). Für sudo, Admin-Abfragen und den Sperrbildschirm einrichten?" j ;;
+      unsupported)
+        note "Fingerabdruckleser $FP_DEV erkannt, er wird von libfprint aber nicht unterstützt." ;;
+    esac
+  fi
+elif is_yes "$FINGERPRINT"; then FINGERPRINT=1; else FINGERPRINT=0; fi
+
 # ---------- Desktop-Extras ----------
 if [[ $DESKTOP != none ]]; then
-  echo
-  ask_yn PRINTING  "Drucker-Unterstützung (CUPS, Netzwerkdrucker automatisch finden)?" j
-  ask_yn BLUETOOTH "Bluetooth?" j
-  ask_yn STEAM     "Steam und Gamemode?" n
+  ask_multi "Desktop-Extras" \
+    PRINTING  "Drucker (CUPS, Netzwerkdrucker automatisch finden)" j \
+    BLUETOOTH "Bluetooth" j \
+    STEAM     "Steam und Gamemode" n \
+    FLATPAK   "Flatpak mit Flathub" j
 else
   PRINTING=0; BLUETOOTH=0; STEAM=0
+  FLATPAK=0   # Flatpak braucht XDG-Portale, die erst ein Desktop mitbringt
 fi
 
 # ---------- Samba ----------
@@ -1241,18 +1645,8 @@ case $CONTAINERS in none|podman|docker) ;; *) die "CONTAINERS muss none, podman 
 echo
 echo "Audio: PipeWire mit ALSA (inkl. 32 bit), PulseAudio- und JACK-Unterstützung wird eingerichtet."
 
-# ---------- 6.–10. Ja/Nein ----------
+# ---------- Verschlüsselung und Bootloader ----------
 echo
-if [[ $DESKTOP != none ]]; then
-  ask_yn FLATPAK  "Flatpak mit Flathub einrichten?" j
-else
-  FLATPAK=0   # Flatpak braucht XDG-Portale, die erst ein Desktop mitbringt
-fi
-ask_yn UNFREE    "Unfreie Pakete erlauben (z. B. NVIDIA-Treiber, Steam)?" j
-if (( ! UNFREE )) && { [[ $GPU == nvidia || $GPU == nvidia-prime ]] || (( STEAM )); }; then
-  warn "NVIDIA-Treiber und Steam brauchen unfreie Pakete, Unfree wird aktiviert."
-  UNFREE=1
-fi
 ask_yn ENCRYPT    "Datenträger mit LUKS verschlüsseln?" n
 ask_yn UKI        "UKI (Unified Kernel Image) über lanzaboote? Bereitet Secure Boot vor" n
 TPM2=${TPM2:-}
@@ -1261,8 +1655,33 @@ if (( ENCRYPT && UKI )) && [[ $(cat /sys/class/tpm/tpm0/tpm_version_major 2>/dev
 else
   TPM2=0
 fi
-ask_yn SILENT     "Silent Boot (Plymouth-Startbildschirm, minimale Meldungen)?" j
-ask_yn SNAPPER    "Automatische Snapshots für /home (snapper, stündlich, wird ausgedünnt)?" j
+
+# ---------- YubiKey/FIDO2 ----------
+if (( ENCRYPT )); then
+  ask_yn FIDO2_LUKS "YubiKey/FIDO2-Schlüssel zum Entsperren der Verschlüsselung? (wird am Ende eingerichtet, Passwort bleibt als Rückfall)" n
+else
+  FIDO2_LUKS=0
+fi
+ask_yn FIDO2_SUDO "YubiKey/FIDO2-Schlüssel für sudo$(if [[ $DESKTOP != none ]]; then echo " und Admin-Abfragen"; fi) (antippen statt Passwort)?" n
+
+# ---------- Weitere Optionen ----------
+if (( UKI )) || [[ $(uname -m) != x86_64 ]]; then
+  RESCUE=0   # Memtest86+ und netboot.xyz gibt es nur mit systemd-boot auf x86_64
+  ask_multi "Weitere Optionen" \
+    UNFREE  "Unfreie Pakete erlauben (z. B. NVIDIA-Treiber, Steam)" j \
+    SILENT  "Silent Boot (Plymouth-Startbildschirm, minimale Meldungen)" j \
+    SNAPPER "Automatische Snapshots für /home (snapper, stündlich, wird ausgedünnt)" j
+else
+  ask_multi "Weitere Optionen" \
+    UNFREE  "Unfreie Pakete erlauben (z. B. NVIDIA-Treiber, Steam)" j \
+    SILENT  "Silent Boot (Plymouth-Startbildschirm, minimale Meldungen)" j \
+    SNAPPER "Automatische Snapshots für /home (snapper, stündlich, wird ausgedünnt)" j \
+    RESCUE  "Rettungseinträge im Bootmenü (Memtest86+, netboot.xyz)" j
+fi
+if (( ! UNFREE )) && { [[ $GPU == nvidia || $GPU == nvidia-prime ]] || (( STEAM )); }; then
+  note "NVIDIA-Treiber und Steam brauchen unfreie Pakete, Unfree wird aktiviert."
+  UNFREE=1
+fi
 
 # ---------- Backup ----------
 ask_yn BACKUP "Backup von /home auf einen anderen Rechner (restic, täglich)?" n
@@ -1271,13 +1690,7 @@ if (( BACKUP )); then
   ask BACKUP_REPO "Backup-Ziel, z. B. sftp:benutzer@nas:/backup/laptop oder rest:http://server:8000/" ""
   [[ $BACKUP_REPO =~ ^(sftp:|rest:|s3:|b2:|azure:|gs:|rclone:|/) ]] || die "Unbekanntes restic-Ziel: $BACKUP_REPO"
   [[ $BACKUP_REPO != *[\"\$\\]* ]] || die "Das Backup-Ziel darf keine Anführungszeichen, \$ oder \\ enthalten."
-  while true; do
-    read -rsp "Passwort für das Backup (verschlüsselt die Daten, unbedingt aufheben): " BACKUP_PASS; echo
-    read -rsp "Passwort wiederholen: " pass2; echo
-    if [[ -n $BACKUP_PASS && $BACKUP_PASS == "$pass2" ]]; then break; fi
-    warn "Leer oder nicht gleich, bitte nochmal."
-  done
-  unset pass2
+  ask_pass BACKUP_PASS "Passwort für das Backup (verschlüsselt die Daten, unbedingt aufheben)"
 fi
 
 ask_yn AUTOUPDATE "Automatische Updates (nachts, ohne Neustart)?" n
@@ -1285,8 +1698,7 @@ ask_yn AUTOUPDATE "Automatische Updates (nachts, ohne Neustart)?" n
 # ---------- Laptop ----------
 if (( LAPTOP )); then
   echo
-  echo "Laptop erkannt (Akku vorhanden)."
-  ask_yn HIBERNATE "Ruhezustand (Hibernate) ermöglichen? Das Swapfile wird dafür mindestens so groß wie der RAM (${RAM_GIB} GiB)" j
+  ask_yn HIBERNATE "Laptop erkannt. Ruhezustand (Hibernate) ermöglichen? Das Swapfile wird dafür mindestens so groß wie der RAM (${RAM_GIB} GiB)" j
   if (( HIBERNATE )); then
     choose LID "Beim Zuklappen des Deckels?" 2 \
       "suspend|Standby" \
@@ -1315,22 +1727,30 @@ else
   OHMYZSH=0
 fi
 
+ask_yn HOME_MANAGER "Benutzer-Einstellungen (Shell, Aliase, Git) mit home-manager verwalten? Sie stehen dann in /etc/nixos/home.nix" j
+if (( HOME_MANAGER )); then
+  ask GIT_NAME "Git: Name für Commits (leer = später)" "" '^[^"\\$]*$' "Name ohne Anführungszeichen, \\ und \$"
+  ask GIT_EMAIL "Git: E-Mail für Commits (leer = später)" "" '^([^@[:space:]"\\$]+@[^@[:space:]"\\$]+)?$' "Ungültige E-Mail-Adresse"
+else
+  GIT_NAME=${GIT_NAME-}; GIT_EMAIL=${GIT_EMAIL-}
+fi
+
 ask_yn SSHD "SSH-Zugang einrichten (nur mit Schlüssel, kein Passwort)?" n
 SSH_KEYS_NIX=""
 if (( SSHD )); then
   ask SSH_KEYS "Öffentlichen Schlüssel einfügen oder gh:<GitHub-Name> (leer = später)" ""
   if [[ -n ${SSH_KEYS:-} ]]; then SSH_KEYS_NIX=$(ssh_keys_nix "$SSH_KEYS"); fi
   if [[ -z $SSH_KEYS_NIX ]]; then
-    warn "Ohne Schlüssel ist kein SSH-Login möglich. Später unter users.users.<name>.openssh.authorizedKeys.keys eintragen."
+    note "Ohne Schlüssel ist kein SSH-Login möglich. Später unter users.users.<name>.openssh.authorizedKeys.keys eintragen."
   fi
 fi
 
 # ---------- Weitere Angaben ----------
 echo
-ask NIX_HOSTNAME "Hostname" "nixos"
+ask NIX_HOSTNAME "Hostname" "nixos" '^[a-zA-Z0-9][a-zA-Z0-9-]{0,62}$' "Ungültiger Hostname (Buchstaben, Ziffern, -)"
 [[ $NIX_HOSTNAME =~ ^[a-zA-Z0-9][a-zA-Z0-9-]{0,62}$ ]] || die "Ungültiger Hostname."
 
-ask NIX_USER "Benutzername"
+ask NIX_USER "Benutzername" "" '^[a-z_][a-z0-9_-]{0,31}$' "Ungültiger Benutzername (klein, a-z 0-9 _ -)"
 [[ $NIX_USER =~ ^[a-z_][a-z0-9_-]{0,31}$ ]] || die "Ungültiger Benutzername (klein, a-z 0-9 _ -)."
 
 ask EXTRA_USERS "Weitere Benutzer ohne Admin-Rechte, durch Leerzeichen getrennt (leer = keine)" ""
@@ -1340,11 +1760,11 @@ for u in $EXTRA_USERS; do
 done
 
 if (( HIBERNATE )); then swapdef=$RAM_GIB; else swapdef=8; fi
-ask SWAP_GB "Swapfile in GiB (0 = kein Swap)" "$swapdef"
+ask SWAP_GB "Swapfile in GiB (0 = kein Swap)" "$swapdef" '^[0-9]+$' "Bitte eine ganze Zahl eingeben"
 [[ $SWAP_GB =~ ^[0-9]+$ ]] || die "Swap-Größe muss eine ganze Zahl sein."
 if (( HIBERNATE && SWAP_GB == 0 )); then die "Der Ruhezustand braucht ein Swapfile."; fi
 if (( HIBERNATE && SWAP_GB < RAM_GIB )); then
-  warn "Für einen sicheren Ruhezustand sollte das Swapfile mindestens ${RAM_GIB} GiB groß sein."
+  note "Für einen sicheren Ruhezustand sollte das Swapfile mindestens ${RAM_GIB} GiB groß sein."
 fi
 
 # nvme0n1 -> nvme0n1p1, sda -> sda1
@@ -1352,8 +1772,6 @@ if [[ $DISK =~ [0-9]$ ]]; then P="${DISK}p"; else P="$DISK"; fi
 ESP="${P}1"
 ROOTPART="${P}2"
 ESP_END_MIB=$(( 1 + ESP_GB * 1024 ))   # Start bei 1 MiB, damit die ESP volle ESP_GB GiB hat
-
-yn() { if (( $1 )); then echo ja; else echo nein; fi; }
 
 case $KERNEL in
   latest) KERNEL_ATTR=linuxPackages_latest ;;
@@ -1365,6 +1783,7 @@ esac
 #  Paketquelle und Vorabprüfung (es wurde noch nichts gelöscht)
 # =====================================================================
 
+if (( USE_DIALOG )); then clear >/dev/tty 2>/dev/null || true; fi
 info "Setze Paketquelle auf $CHANNEL_NAME"
 nix-channel --add "https://channels.nixos.org/$CHANNEL_NAME" nixos
 nix-channel --update nixos || die "Paketquelle nicht erreichbar. Netzwerk prüfen. Es wurde nichts gelöscht."
@@ -1375,6 +1794,15 @@ if [[ $TARGET_RELEASE =~ ^[0-9]{2}\.[0-9]{2}$ ]]; then
   STATE_VERSION=$TARGET_RELEASE
 else
   STATE_VERSION=$(nixos-version 2>/dev/null | grep -oE '^[0-9]{2}\.[0-9]{2}' || echo "26.05")
+fi
+if (( HOME_MANAGER )); then
+  if [[ $CHANNEL == unstable ]]; then hm_branch=master; else hm_branch=release-$LATEST_REL; fi
+  if ! add_channel home-manager "https://github.com/nix-community/home-manager/archive/$hm_branch.tar.gz"; then
+    if [[ $hm_branch == master ]]; then die "home-manager ist nicht erreichbar. Es wurde nichts gelöscht."; fi
+    warn "home-manager hat (noch) keinen Zweig $hm_branch, nehme master."
+    add_channel home-manager "https://github.com/nix-community/home-manager/archive/master.tar.gz" \
+      || die "home-manager ist nicht erreichbar. Es wurde nichts gelöscht."
+  fi
 fi
 # Avahi-Optionen wurden umbenannt; prüfen, welche Form die gewählte Quelle kennt
 if [[ $SAMBA == server ]] && [[ $(nix-instantiate --eval -E '(import <nixpkgs/nixos> { configuration = {}; }).options.services.avahi ? settings' 2>/dev/null) == true ]]; then
@@ -1388,16 +1816,22 @@ LUKS_UUID=00000000-0000-0000-0000-000000000000
 RESUME_UUID=00000000-0000-0000-0000-000000000000
 RESUME_OFFSET=0
 build_config "$PRE/configuration.nix"
-if ! nix-instantiate '<nixpkgs/nixos>' -A system -I "nixos-config=$PRE/configuration.nix" > "$PRE/ergebnis.txt" 2>&1; then
+while ! nix-instantiate '<nixpkgs/nixos>' -A system -I "nixos-config=$PRE/configuration.nix" > "$PRE/ergebnis.txt" 2>&1; do
   tail -n 30 "$PRE/ergebnis.txt" >&2
-  die "Die erzeugte Konfiguration ist fehlerhaft (siehe oben, Datei: $PRE/configuration.nix). Es wurde nichts gelöscht."
-fi
+  if [[ $HW_PROFILE == none ]]; then
+    die "Die erzeugte Konfiguration ist fehlerhaft (siehe oben, Datei: $PRE/configuration.nix). Es wurde nichts gelöscht."
+  fi
+  unset HW_RETRY
+  ask_yn HW_RETRY "Die Konfiguration mit dem Hardware-Profil $HW_PROFILE ist fehlerhaft (Details im Protokoll). Ohne Profil erneut prüfen?" j
+  if (( ! HW_RETRY )); then die "Abgebrochen, nichts verändert. Datei: $PRE/configuration.nix"; fi
+  HW_PROFILE=none
+  build_config "$PRE/configuration.nix"
+done
 if grep -qi 'evaluation warning' "$PRE/ergebnis.txt"; then grep -i -A1 'evaluation warning' "$PRE/ergebnis.txt" | head -n 10; fi
 echo "  Konfiguration ist gültig."
 
 # ---------- Zusammenfassung ----------
-info "Zusammenfassung"
-cat <<EOF
+SUMMARY=$(cat <<EOF
   Datenträger:    $DISK
     ${ESP}  ${ESP_GB} GiB FAT32 -> /boot
     ${ROOTPART}  Rest, $( if (( ENCRYPT )); then echo "LUKS2 -> btrfs"; else echo "btrfs"; fi ) ($COMPRESS)
@@ -1410,6 +1844,8 @@ cat <<EOF
   Zeitzone:       $TIMEZONE
   Desktop:        $DESKTOP$(if [[ $DESKTOP != none ]]; then echo " ($DESKTOP_MODE)"; fi)
   Grafik:         $GPU$(if [[ $GPU == nvidia* ]]; then echo " (offene Module: $(yn "$NV_OPEN"))"; fi)
+  HW-Profil:      $(if [[ $HW_PROFILE != none ]]; then echo "nixos-hardware $HW_PROFILE"; else echo keins; fi)
+  Fingerabdruck:  $(yn "$FINGERPRINT")
   Extras:         Drucken $(yn "$PRINTING"), Bluetooth $(yn "$BLUETOOTH"), Steam $(yn "$STEAM")
   Samba:          $(case $SAMBA in none) echo nein ;; client) echo "Client (Netzlaufwerke nutzen)" ;; server) echo "Client + Freigabe ~/Freigabe" ;; esac)
   VMs/Container:  libvirt $(yn "$LIBVIRT"), Container: $CONTAINERS
@@ -1419,22 +1855,38 @@ cat <<EOF
   Flatpak:        $(yn "$FLATPAK")$(if (( FLATPAK )); then echo " (Flathub)"; fi)
   Unfree:         $(yn "$UNFREE")
   Verschlüsselt:  $(yn "$ENCRYPT")$(if (( TPM2 )); then echo " (TPM2 vorbereitet)"; fi)
+  YubiKey/FIDO2:  Verschlüsselung $(yn "$FIDO2_LUKS"), sudo $(yn "$FIDO2_SUDO")
+  Bootmenü:       $(if (( RESCUE )); then echo "mit Memtest86+ und netboot.xyz"; elif (( UKI )); then echo "UKI (ohne Rettungseinträge)"; else echo "ohne Rettungseinträge"; fi)
   Snapshots:      $(yn "$SNAPPER")$(if (( SNAPPER )); then echo " (/home, snapper)"; fi)
   Backup:         $(if (( BACKUP )); then echo "restic täglich nach $BACKUP_REPO"; else echo nein; fi)
   Laptop:         $(if (( LAPTOP )); then echo "ja, Ruhezustand $(yn "$HIBERNATE"), Deckel: $LID$(if (( CPU_INTEL )); then echo ", thermald"; fi)"; else echo nein; fi)
   Auto-Updates:   $(yn "$AUTOUPDATE")
+  Aufräumen:      wöchentlich (nh clean, letzte 10 Generationen bleiben)
   Shell:          $LOGIN_SHELL$(if [[ $LOGIN_SHELL == zsh ]]; then echo " (oh-my-zsh: $(yn "$OHMYZSH"))"; fi)
+  home-manager:   $(if (( HOME_MANAGER )); then echo "ja, /etc/nixos/home.nix${GIT_NAME:+, Git: $GIT_NAME}${GIT_EMAIL:+ <$GIT_EMAIL>}"; else echo nein; fi)
   Hostname:       $NIX_HOSTNAME
   Benutzer:       $NIX_USER (Admin)${EXTRA_USERS:+, $EXTRA_USERS}
   Swap:           ${SWAP_GB} GiB Swapfile$(if (( ZRAM )); then echo " + zram"; fi)
   SSH:            $(yn "$SSHD")$(if (( SSHD )); then if [[ -n $SSH_KEYS_NIX ]]; then echo " ($(grep -c . <<<"$SSH_KEYS_NIX") Schlüssel)"; else echo " (noch ohne Schlüssel)"; fi; fi)
 EOF
-echo
-warn "ALLE Daten auf $DISK werden gelöscht:"
-lsblk -po NAME,SIZE,TYPE,FSTYPE,LABEL,MOUNTPOINTS "$DISK"
-echo "Eingehängte Partitionen, Swap, LVM, RAID und LUKS auf $DISK werden vorher automatisch gelöst."
-read -rp "Zum Fortfahren den Gerätenamen ($DISK) erneut eingeben: " confirm
+)
+info "Zusammenfassung"
+printf '%s\n\n' "$SUMMARY"
+DISK_INFO=$(lsblk -po NAME,SIZE,TYPE,FSTYPE,LABEL,MOUNTPOINTS "$DISK")
+if (( USE_DIALOG )); then
+  dlg --title "Zusammenfassung (Pfeiltasten blättern)" --cr-wrap --no-collapse \
+      --yes-label "Weiter" --no-label "Abbrechen" --yesno "$SUMMARY" 0 0 || dlg_abort
+  confirm=$(dlg --title "Letzte Sicherheitsabfrage" --cr-wrap --no-collapse --inputbox \
+    "ALLE Daten auf $DISK werden gelöscht:"$'\n\n'"$DISK_INFO"$'\n\n'"Eingehängtes, Swap, LVM, RAID und LUKS werden vorher gelöst."$'\n'"Zum Fortfahren den Gerätenamen ($DISK) eingeben:" 0 0) || dlg_abort
+  clear >/dev/tty 2>/dev/null || true
+else
+  warn "ALLE Daten auf $DISK werden gelöscht:"
+  printf '%s\n' "$DISK_INFO"
+  echo "Eingehängte Partitionen, Swap, LVM, RAID und LUKS auf $DISK werden vorher automatisch gelöst."
+  read -rp "Zum Fortfahren den Gerätenamen ($DISK) erneut eingeben: " confirm
+fi
 [[ $confirm == "$DISK" ]] || die "Abgebrochen, nichts verändert."
+WIPED=1
 
 # =====================================================================
 #  Platte vorbereiten
@@ -1536,8 +1988,9 @@ build_config "$CFG"
 
 
 echo "  $CFG geschrieben (Original: configuration.nix.generated)"
-read -rp "configuration.nix vor der Installation ansehen/bearbeiten? [j/N] " edit
-if is_yes "${edit:-n}"; then "${EDITOR:-nano}" "$CFG" </dev/tty >/dev/tty 2>&1; fi
+unset EDIT_CFG
+ask_yn EDIT_CFG "configuration.nix vor der Installation ansehen/bearbeiten?" n
+if (( EDIT_CFG )); then "${EDITOR:-nano}" "$CFG" </dev/tty >/dev/tty 2>&1; fi
 
 # =====================================================================
 #  Installation
@@ -1557,7 +2010,9 @@ if (( UKI )); then
 else
   info "Installiere NixOS (je nach Desktop und Leitung 10–30 Minuten)"
 fi
-while ! nixos-install --no-root-passwd; do
+# Alle Kanäle (nixos, ggf. home-manager und nixos-hardware) ins neue System übernehmen
+CHANNELS_PATH=$(readlink -f /nix/var/nix/profiles/per-user/root/channels)
+while ! nixos-install --no-root-passwd --channel "$CHANNELS_PATH"; do
   warn "nixos-install ist fehlgeschlagen. Die Ursache steht oben und im Protokoll."
   unset RETRY
   choose RETRY "Wie weiter?" 1 \
@@ -1571,6 +2026,10 @@ while ! nixos-install --no-root-passwd; do
   esac
 done
 
+# Kanal-Liste für spätere Updates (nix-channel --update) im neuen System
+install -d -m 700 /mnt/root
+nix-channel --list | awk 'NF == 2 { print $2, $1 }' > /mnt/root/.nix-channels
+
 info "root-Passwort setzen"
 until nixos-enter --root /mnt -c 'passwd root'; do warn "Nochmal versuchen."; done
 
@@ -1582,7 +2041,7 @@ for u in $EXTRA_USERS; do
   until nixos-enter --root /mnt -c "passwd $u"; do warn "Nochmal versuchen."; done
 done
 
-if [[ $LOGIN_SHELL == zsh ]]; then
+if [[ $LOGIN_SHELL == zsh ]] && (( ! HOME_MANAGER )); then
   for u in $NIX_USER $EXTRA_USERS; do
     info "Lege ~/.zshrc für $u an"
     # Ohne ~/.zshrc startet zsh beim ersten Login den Einrichtungsassistenten
@@ -1606,6 +2065,41 @@ if (( BACKUP )); then
     else
       warn "SSH-Schlüssel für das Backup konnte nicht erzeugt werden. Später: sudo ssh-keygen -t ed25519"
     fi
+  fi
+fi
+
+# Fragt bei einem fehlgeschlagenen Schritt mit Sicherheitsschlüssel nach; 0 = nochmal, 1 = überspringen
+key_retry() {
+  unset KEY_RETRY
+  choose KEY_RETRY "$1 hat nicht geklappt. Wie weiter?" 1 \
+    "again|Nochmal versuchen (Schlüssel eingesteckt?)" \
+    "skip|Überspringen, später einrichten"
+  [[ $KEY_RETRY == again ]]
+}
+
+if (( FIDO2_LUKS )); then
+  info "YubiKey/FIDO2 für die Verschlüsselung: Schlüssel einstecken. Erst das LUKS-Passwort, dann ggf. die PIN des Schlüssels, dann antippen"
+  until systemd-cryptenroll --fido2-device=auto "$ROOTPART" </dev/tty; do
+    if ! key_retry "Das Einrichten des Schlüssels für die Verschlüsselung"; then
+      FIDO2_LUKS_LATER=1
+      break
+    fi
+  done
+fi
+
+if (( FIDO2_SUDO )); then
+  info "YubiKey/FIDO2 für sudo: Schlüssel einstecken, ggf. PIN eingeben und antippen, wenn er blinkt"
+  until U2F_LINE=$(nix-shell -p pam_u2f --run "pamu2fcfg -u $NIX_USER -o pam://$NIX_HOSTNAME -i pam://$NIX_HOSTNAME" </dev/tty) \
+        && [[ $U2F_LINE == "$NIX_USER:"* ]]; do
+    if ! key_retry "Das Einrichten des Schlüssels für sudo"; then
+      U2F_LINE=""
+      break
+    fi
+  done
+  if [[ -n ${U2F_LINE-} ]]; then
+    nixos-enter --root /mnt -c "install -d -m 700 -o $NIX_USER -g users /home/$NIX_USER/.config /home/$NIX_USER/.config/Yubico"
+    printf '%s\n' "$U2F_LINE" > "/mnt/home/$NIX_USER/.config/Yubico/u2f_keys"
+    nixos-enter --root /mnt -c "chown $NIX_USER:users /home/$NIX_USER/.config/Yubico/u2f_keys && chmod 600 /home/$NIX_USER/.config/Yubico/u2f_keys"
   fi
 fi
 
@@ -1653,14 +2147,34 @@ if (( BACKUP )); then
   fi
   echo "  Das Backup-Passwort gut aufheben, ohne es ist keine Wiederherstellung möglich."
 fi
+if (( FINGERPRINT )); then
+  echo "  Fingerabdruck einlernen: fprintd-enroll (oder Systemeinstellungen -> Benutzer)"
+fi
+if (( ${FIDO2_LUKS_LATER:-0} )); then
+  echo "  YubiKey für die Verschlüsselung später: sudo systemd-cryptenroll --fido2-device=auto /dev/disk/by-uuid/$LUKS_UUID"
+fi
+if (( FIDO2_SUDO )) && [[ -z ${U2F_LINE-} ]]; then
+  echo "  YubiKey für sudo später: mkdir -p ~/.config/Yubico && pamu2fcfg -o pam://$NIX_HOSTNAME -i pam://$NIX_HOSTNAME > ~/.config/Yubico/u2f_keys"
+  echo "    (pamu2fcfg mit: nix-shell -p pam_u2f)"
+fi
+if (( FIDO2_SUDO )); then
+  echo "  Zweiten YubiKey als Ersatz anmelden: pamu2fcfg -n -o pam://$NIX_HOSTNAME -i pam://$NIX_HOSTNAME >> ~/.config/Yubico/u2f_keys"
+fi
+if (( HOME_MANAGER )); then
+  echo "  Benutzer-Einstellungen (Shell, Aliase, Git): /etc/nixos/home.nix, danach: sudo nixos-rebuild switch"
+fi
+if [[ $HW_PROFILE != none ]]; then
+  echo "  Hardware-Profil: nixos-hardware $HW_PROFILE (Updates mit: sudo nix-channel --update)"
+fi
 echo "  Antworten für weitere Installationen: /etc/nixos/install-antworten.env"
 if [[ $SAMBA == server ]]; then
   echo "  Samba-Freigabe: Windows \\\\$NIX_HOSTNAME\\freigabe, macOS/Linux smb://$NIX_HOSTNAME/freigabe"
 fi
 install -m 600 "$LOG" /mnt/var/log/nixos-install.log
 echo "  Protokoll gespeichert unter /var/log/nixos-install.log"
-read -rp "Jetzt aushängen und neu starten? [J/n] " rb
-if [[ ${rb,,} != n* ]]; then
+unset REBOOT
+ask_yn REBOOT "Jetzt aushängen und neu starten?" j
+if (( REBOOT )); then
   umount -R /mnt
   if (( ENCRYPT )); then cryptsetup close cryptroot; fi
   reboot
