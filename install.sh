@@ -23,6 +23,8 @@
 #   ROOT_PASS / ROOT_HASH (ohne: root gesperrt)                EXTRA_PASS / EXTRA_HASH  weitere Benutzer
 #   SAMBA_PASS  BACKUP_PASS  TS_AUTHKEY (Tailscale)            *_HASH z. B. von: mkpasswd -m yescrypt
 # Wird eine zweite Platte gelöscht (RAID1, Datenplatte), zusätzlich CONFIRM_DISK2. Neustart am Ende: REBOOT=j|n.
+# DISK=auto nimmt die einzige interne Platte. CONFIRM_DISK=auto bestätigt mit einem Countdown
+# (AUTO_WARTEN Sekunden, Standard 30, jede Taste bricht ab) – gedacht für das eigene Installer-ISO.
 #
 #   CHANNEL      release (neuestes stabiles Release) | unstable
 #   KB           Tastatur als xkb-Layout[:Variante], z. B. de, de:nodeadkeys, us:intl
@@ -48,11 +50,15 @@
 #   Ja/Nein (j/n): PRINTING BLUETOOTH STEAM LIBVIRT FLATPAK UNFREE ENCRYPT UKI TPM2 SILENT
 #                  SNAPPER BACKUP HIBERNATE AUTOUPDATE OHMYZSH SSHD NV_OPEN FINGERPRINT
 #                  FIDO2_LUKS FIDO2_SUDO RESCUE HOME_MANAGER FAIL2BAN WIFI_COPY ADVANCED
+#                  SB_ENROLL (Secure-Boot-Schlüssel gleich eintragen) SSH_UNLOCK (LUKS per SSH entsperren)
+#                  DISK_FORCE, DISK2_FORCE (trotz SMART-Warnung installieren)
 # Ohne Abfrage, nur per Variable: ESP_GB (Größe von /boot in GiB, 1), COMPRESS (zstd), ZRAM (j),
 #   BOOT_MODE (uefi | bios; Standard: wie der USB-Stick gestartet wurde),
 #   KERNEL (latest = neuester stabiler Kernel | lts = Standard-Kernel des Releases),
 #   TUI (j = Menüs mit dialog, n = reine Textabfragen),
-#   DB_MIN_GB (Dual-Boot: mindestens so viel freier Platz in GiB, 20)
+#   DB_MIN_GB (Dual-Boot: mindestens so viel freier Platz in GiB, 20),
+#   GEOIP (j = Tastatur, Sprache und Zeitzone nach Standort vorschlagen, n = aus),
+#   EXTRA_CA (zusätzliches CA-Zertifikat für das neue System). Ein Proxy (https_proxy) wird übernommen.
 #
 # Das komplette Protokoll landet in /var/log/nixos-install.log des neuen Systems.
 
@@ -637,13 +643,153 @@ dualboot_plan() {
   rmdir "$tmp"
 }
 
+# Werkzeug aus dem Live-System oder über Nix holen: tool_bin BEFEHL PAKET -> Pfad (leer = nicht verfügbar)
+tool_bin() {
+  local p
+  if p=$(command -v "$1" 2>/dev/null); then echo "$p"; return 0; fi
+  p=$(nix-build '<nixpkgs>' -A "$2" --no-out-link 2>/dev/null) || return 0
+  [[ -n $p ]] || return 0
+  if [[ -x $p/bin/$1 ]]; then echo "$p/bin/$1"; elif [[ -x $p/sbin/$1 ]]; then echo "$p/sbin/$1"; fi
+}
+
+# Wert einer UEFI-Variable (Secure Boot, Setup Mode): 1 = an
+efi_var() {
+  od -An -t u1 -j4 -N1 "/sys/firmware/efi/efivars/$1-8be4df61-93ca-11d2-aa0d-00e098032b8c" 2>/dev/null | tr -d ' ' || true
+}
+
+# Kernel-Module der kabelgebundenen Netzwerkkarten (für das Netz schon beim Start)
+nic_modules() {
+  local n i m
+  for n in /sys/class/net/*; do
+    i=${n##*/}
+    if [[ $i == lo || -d $n/wireless || ! -e $n/device ]]; then continue; fi
+    if [[ -n ${1-} && $i != "$1" ]]; then continue; fi
+    if [[ -L $n/device/driver/module ]]; then   # fest eingebaute Treiber haben keinen Modul-Link
+      m=$(readlink -f "$n/device/driver/module")
+      echo "${m##*/}"
+    fi
+  done | sort -u
+}
+
+# Plattenzustand per SMART: gibt Warnungen aus (leer = in Ordnung), Rückgabe 1 = nicht auslesbar
+disk_health() {
+  local out
+  [[ -n $SMARTCTL ]] || return 1
+  out=$("$SMARTCTL" -H -A "$1" 2>/dev/null || true)
+  grep -q 'self-assessment test result' <<<"$out" || return 1
+  awk '
+    /self-assessment test result/ && !/PASSED/ { print "  SMART-Gesamturteil: " $NF }
+    $1 ~ /^(5|187|197|198)$/ && NF >= 10 && $10 + 0 > 0 { print "  " $2 ": " $10 }
+    $1 ~ /^[0-9]+$/ && NF >= 10 && $9 != "-" { print "  " $2 ": Grenzwert erreicht (" $9 ")" }
+    /^Critical Warning:/ && $NF != "0x00" { print "  NVMe-Warnung: " $NF }
+    /^Percentage Used:/ { v = $NF; sub(/%/, "", v); if (v + 0 >= 90) print "  Abnutzung: " $NF }
+    /^Media and Data Integrity Errors:/ { v = $NF; gsub(/[.,]/, "", v); if (v + 0 > 0) print "  Datenfehler: " $NF }
+  ' <<<"$out"
+}
+
+# check_disk_health GERÄT VAR – bei Warnungen nachfragen, VAR=j erlaubt es trotzdem
+check_disk_health() {
+  local dev=$1 var=$2 warns
+  if (( IS_VM )); then return 0; fi
+  if ! warns=$(disk_health "$dev"); then
+    echo "  Plattenzustand $dev: nicht auslesbar (kein SMART, z. B. USB-Gehäuse)"
+    return 0
+  fi
+  if [[ -z $warns ]]; then
+    echo "  Plattenzustand $dev: in Ordnung (SMART)"
+    return 0
+  fi
+  note "Plattenzustand $dev ist bedenklich:"$'\n'"$warns"$'\n'"Details: smartctl -a $dev"
+  ask_yn "$var" "$dev zeigt Verschleiß oder Fehler. Trotzdem darauf installieren?" n
+  (( ${!var} )) || die "Abgebrochen, nichts verändert. Platte prüfen oder tauschen (smartctl -a $dev)."
+}
+
+# Vorschläge für Tastatur, Sprache und Zeitzone: aus dem Live-System, sonst nach Standort (GeoIP)
+detect_live_defaults() {
+  local tz kb="" v="" uid out xml cc="" c_kb="" c_loc=""
+  tz=$(timedatectl show -p Timezone --value 2>/dev/null || true)
+  if [[ -n $tz && $tz != UTC && $tz != Etc/UTC ]]; then DEF_TZ=$tz; fi
+  # Tastatur der grafischen Live-Sitzung (Plasma, GNOME), sonst localectl
+  if [[ -r /home/nixos/.config/kxkbrc ]]; then
+    kb=$(sed -n 's/^LayoutList=//p' /home/nixos/.config/kxkbrc | cut -d, -f1)
+    v=$(sed -n 's/^VariantList=//p' /home/nixos/.config/kxkbrc | cut -d, -f1)
+  elif uid=$(id -u nixos 2>/dev/null) && [[ -S /run/user/$uid/bus ]] && command -v gsettings >/dev/null; then
+    out=$(timeout 5 runuser -u nixos -- env "DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/$uid/bus" \
+          gsettings get org.gnome.desktop.input-sources sources 2>/dev/null || true)
+    out=$(grep -o "('xkb', '[^']*')" <<<"$out" | head -n1 | sed "s/.*'xkb', '\([^']*\)'.*/\1/" || true)
+    kb=${out%%+*}
+    if [[ $out == *+* ]]; then v=${out#*+}; fi
+  fi
+  if [[ -z $kb ]]; then
+    out=$(localectl status 2>/dev/null || true)
+    kb=$(sed -n 's/^ *X11 Layout: //p' <<<"$out" | cut -d, -f1)
+    v=$(sed -n 's/^ *X11 Variant: //p' <<<"$out" | cut -d, -f1)
+    if [[ $kb == us && -z $v ]]; then kb=""; fi   # Standard des Sticks, sagt nichts aus
+  fi
+  if [[ -n $kb ]]; then DEF_KB=$kb${v:+:$v}; fi
+  # Standort über den GeoIP-Dienst von Ubuntu (GEOIP=n schaltet das ab)
+  if [[ ${GEOIP:-j} != [nN]* ]]; then
+    xml=$(curl -fsS --max-time 5 https://geoip.ubuntu.com/lookup 2>/dev/null || true)
+    cc=$(sed -n 's:.*<CountryCode>\([A-Z][A-Z]\)</CountryCode>.*:\1:p' <<<"$xml")
+    tz=$(sed -n 's:.*<TimeZone>\([A-Za-z0-9_/+-]*\)</TimeZone>.*:\1:p' <<<"$xml")
+    if [[ -z $DEF_TZ && -n $tz ]]; then DEF_TZ=$tz; fi
+  fi
+  case $cc in
+    DE)    c_kb=de c_loc=de_DE.UTF-8 ;;
+    AT)    c_kb=at c_loc=de_AT.UTF-8 ;;
+    CH|LI) c_kb=ch c_loc=de_CH.UTF-8 ;;
+    LU)    c_kb=de c_loc=de_LU.UTF-8 ;;
+    US)    c_kb=us c_loc=en_US.UTF-8 ;;
+    GB)    c_kb=gb c_loc=en_GB.UTF-8 ;;
+    IE)    c_kb=ie c_loc=en_IE.UTF-8 ;;
+    FR)    c_kb=fr c_loc=fr_FR.UTF-8 ;;
+    BE)    c_kb=be c_loc=fr_BE.UTF-8 ;;
+    NL)    c_kb=us:intl c_loc=nl_NL.UTF-8 ;;
+    IT)    c_kb=it c_loc=it_IT.UTF-8 ;;
+    ES)    c_kb=es c_loc=es_ES.UTF-8 ;;
+    PT)    c_kb=pt c_loc=pt_PT.UTF-8 ;;
+    PL)    c_kb=pl c_loc=pl_PL.UTF-8 ;;
+    CZ)    c_kb=cz c_loc=cs_CZ.UTF-8 ;;
+    DK)    c_kb=dk c_loc=da_DK.UTF-8 ;;
+    SE)    c_kb=se c_loc=sv_SE.UTF-8 ;;
+    NO)    c_kb=no c_loc=nb_NO.UTF-8 ;;
+    FI)    c_kb='fi' c_loc=fi_FI.UTF-8 ;;
+  esac
+  if [[ -z $DEF_KB ]]; then DEF_KB=$c_kb; fi
+  DEF_LOCALE=$c_loc
+  if [[ -z $DEF_LOCALE ]]; then   # ohne Standort: Sprache passend zur erkannten Tastatur
+    case ${DEF_KB%%:*} in
+      de) DEF_LOCALE=de_DE.UTF-8 ;; at) DEF_LOCALE=de_AT.UTF-8 ;; ch) DEF_LOCALE=de_CH.UTF-8 ;;
+      gb) DEF_LOCALE=en_GB.UTF-8 ;; fr) DEF_LOCALE=fr_FR.UTF-8 ;; it) DEF_LOCALE=it_IT.UTF-8 ;;
+      es) DEF_LOCALE=es_ES.UTF-8 ;; pl) DEF_LOCALE=pl_PL.UTF-8 ;;
+    esac
+  fi
+  # Nur plausible Werte übernehmen
+  [[ $DEF_KB =~ ^[a-z]{2,}(:[a-z0-9_-]+)?$ ]] || DEF_KB=""
+  if [[ -n $DEF_TZ ]] && { [[ ! $DEF_TZ =~ ^[A-Za-z_]+(/[A-Za-z0-9_+-]+)*$ ]] || { [[ -d /etc/zoneinfo ]] && [[ ! -f /etc/zoneinfo/$DEF_TZ ]]; }; }; then
+    DEF_TZ=""
+  fi
+}
+
+# with_default WERT "wert|Text" ... – setzt CHOICES und DEF_IDX; der erkannte Wert wird markiert oder vorne ergänzt
+with_default() {
+  local val=$1 i
+  shift
+  CHOICES=("$@"); DEF_IDX=1
+  [[ -n $val ]] || return 0
+  for i in "${!CHOICES[@]}"; do
+    if [[ ${CHOICES[i]%%|*} == "$val" ]]; then CHOICES[i]+=" (erkannt)"; DEF_IDX=$((i + 1)); return 0; fi
+  done
+  CHOICES=("$val|$val (erkannt)" "${CHOICES[@]}")
+}
+
 # ---------- Antwortdatei ----------
 # Alle Antworten, die gespeichert und wiederverwendet werden (DISK absichtlich nicht)
 ANSWER_VARS=(CHANNEL KB LOCALE TIMEZONE DESKTOP DESKTOP_MODE GPU NV_OPEN KERNEL PRINTING BLUETOOTH
   STEAM SAMBA LIBVIRT CONTAINERS FLATPAK UNFREE ENCRYPT UKI TPM2 SILENT SNAPPER BACKUP BACKUP_REPO
   HIBERNATE LID AUTOUPDATE LOGIN_SHELL OHMYZSH SSHD SSH_KEYS NIX_HOSTNAME NIX_USER EXTRA_USERS
   SWAP_GB ZRAM ESP_GB COMPRESS FINGERPRINT FIDO2_LUKS FIDO2_SUDO RESCUE HOME_MANAGER GIT_NAME
-  GIT_EMAIL FAIL2BAN NET_MODE NET_IF NET_ADDR NET_GW NET_DNS NET_ADDR6 NET_GW6 VPN)
+  GIT_EMAIL FAIL2BAN SB_ENROLL SSH_UNLOCK NET_MODE NET_IF NET_ADDR NET_GW NET_DNS NET_ADDR6 NET_GW6 VPN)
 # Nicht gespeichert, weil rechnerspezifisch: DISK, DISK2, HW_PROFILE, INSTALL_MODE, DISK2_MODE
 # Geheime Werte, nur aus der Passwortdatei (PASSWORT_DATEI), werden nie gespeichert
 SECRET_VARS=(LUKS_PASS ROOT_PASS ROOT_HASH USER_PASS USER_HASH EXTRA_PASS EXTRA_HASH SAMBA_PASS
@@ -710,7 +856,7 @@ write_mock_hw() {
     echo '  fileSystems."/efi" = { device = "/dev/disk/by-label/efi"; fsType = "vfat"; };'
     echo '  fileSystems."/boot" = { device = "/dev/disk/by-label/xboot"; fsType = "vfat"; };'
   elif [[ $BOOT_MODE == uefi ]]; then
-    echo '  fileSystems."/boot" = { device = "/dev/disk/by-label/boot"; fsType = "vfat"; };'
+    echo '  fileSystems."/boot" = { device = "/dev/disk/by-label/BOOT"; fsType = "vfat"; };'
   else
     echo '  fileSystems."/boot" = { device = "/dev/disk/by-label/boot"; fsType = "ext4"; };'
   fi
@@ -726,7 +872,7 @@ write_mock_hw() {
 
 # Baut configuration.nix aus allen Antworten; $1 = Zieldatei
 build_config() {
-  local CFG=$1 n n2 ns addrs routes dns wg_port
+  local CFG=$1 n n2 ns addrs routes dns wg_port net_body="" m mods
 # --- Bausteine ---
 IMPORTS='    ./hardware-configuration.nix'
 if (( UKI )); then IMPORTS+=$'\n    lanzaboote.nixosModules.lanzaboote'; fi
@@ -819,7 +965,7 @@ if (( ENCRYPT )); then
 fi
 if (( TPM2 )); then
   LUKS_NIX+='
-  # TPM2: entsperrt ohne Passwort, sobald "sudo luks-tpm2-enroll" gelaufen ist (nach Secure Boot)
+  # TPM2: entsperrt ohne Passwort, sobald Secure Boot an ist (Anmeldung beim ersten Start, erneut: sudo luks-tpm2-enroll)
   security.tpm2.enable = true;'
 fi
 if (( TPM2 && FIDO2_LUKS )); then
@@ -909,31 +1055,96 @@ SCRUB_NIX+='
   };'
 
 NET_NIX="  networking.hostName = \"$NIX_HOSTNAME\";"
+if [[ -n $LIVE_PROXY ]]; then
+  NET_NIX+="
+  networking.proxy.default = \"$LIVE_PROXY\";  # aus dem Live-System übernommen
+  networking.proxy.noProxy = \"127.0.0.1,localhost\";"
+fi
+if [[ -n ${EXTRA_CA-} ]]; then
+  NET_NIX+="
+  security.pki.certificateFiles = [ ./ca.pem ];  # zusätzliche CA, z. B. für den Proxy der Schule"
+fi
 if [[ $NET_MODE == static ]]; then
   addrs="\"$NET_ADDR\""; routes="{ Gateway = \"$NET_GW\"; }"; dns=""
   if [[ -n $NET_ADDR6 ]]; then addrs+=" \"$NET_ADDR6\""; fi
   if [[ -n $NET_GW6 ]]; then routes+=" { Gateway = \"$NET_GW6\"; }"; fi
   for ns in $NET_DNS; do dns+=" \"$ns\""; done
-  NET_NIX+="
-  # Feste Adresse mit systemd-networkd
-  networking.networkmanager.enable = false;
-  networking.useDHCP = false;
-  networking.useNetworkd = true;
-  systemd.network.networks.\"10-lan\" = {
+  net_body="
     matchConfig.Name = \"$NET_IF\";
     address = [ $addrs ];
     routes = [ $routes ];
     dns = [$dns ];"
   if [[ -z $NET_ADDR6 ]]; then
-    NET_NIX+="
+    net_body+="
     networkConfig.IPv6AcceptRA = true;  # IPv6 automatisch (SLAAC), wenn im Netz vorhanden"
   fi
+  net_body+="
+    linkConfig.RequiredForOnline = \"routable\";"
   NET_NIX+="
-    linkConfig.RequiredForOnline = \"routable\";
+  # Feste Adresse mit systemd-networkd
+  networking.networkmanager.enable = false;
+  networking.useDHCP = false;
+  networking.useNetworkd = true;
+  systemd.network.networks.\"10-lan\" = {$net_body
   };"
 else
   NET_NIX+="
   networking.networkmanager.enable = true;"
+fi
+
+UNLOCK_NIX=""
+if (( SSH_UNLOCK )); then
+  mods=""
+  for m in $SSH_UNLOCK_MODS; do mods+=" \"$m\""; done
+  UNLOCK_NIX="  # Beim Start: ssh -p 2222 root@<rechner>, dann das LUKS-Passwort eingeben
+  boot.initrd.network.enable = true;
+  boot.initrd.network.ssh = {
+    enable = true;
+    port = 2222;  # eigener Port, weil der Host-Schlüssel ein anderer ist als im laufenden System
+    hostKeys = [ \"/etc/secrets/initrd/ssh_host_ed25519_key\" ];  # vom Installer erzeugt
+    authorizedKeys = config.users.users.\"$NIX_USER\".openssh.authorizedKeys.keys;
+  };
+  boot.initrd.systemd.users.root.shell = \"/bin/systemd-tty-ask-password-agent\";  # fragt gleich nach dem Passwort"
+  if [[ -n $mods ]]; then
+    UNLOCK_NIX+="
+  boot.initrd.availableKernelModules = [$mods ];  # Netzwerkkarte schon beim Start laden"
+  fi
+  if [[ $NET_MODE == static ]]; then
+    UNLOCK_NIX+="
+  boot.initrd.systemd.network.networks.\"10-lan\" = {$net_body
+  };"
+  else
+    UNLOCK_NIX+="
+  boot.initrd.network.flushBeforeStage2 = true;  # danach übernimmt NetworkManager
+  boot.initrd.systemd.network.networks.\"10-lan\" = {
+    matchConfig = { Type = \"ether\"; Kind = \"!*\"; };  # alle Netzwerkkarten mit Kabel
+    networkConfig.DHCP = \"yes\";
+  };"
+  fi
+fi
+if (( TPM2 )); then
+  if [[ -n $UNLOCK_NIX ]]; then UNLOCK_NIX+=$'\n'; fi
+  UNLOCK_NIX+="  # TPM2 beim ersten Start mit Secure Boot anmelden (einmaliger Schlüssel vom Installer, wird danach gelöscht)
+  systemd.services.luks-tpm2-erststart = {
+    description = \"LUKS: TPM2 anmelden, sobald Secure Boot aktiv ist\";
+    wantedBy = [ \"multi-user.target\" ];
+    unitConfig.ConditionPathExists = \"/var/lib/luks-tpm2/einmal.key\";
+    serviceConfig.Type = \"oneshot\";
+    path = [ pkgs.coreutils pkgs.cryptsetup config.systemd.package ];
+    script = ''
+      sb=\$(od -An -t u1 -j4 -N1 /sys/firmware/efi/efivars/SecureBoot-8be4df61-93ca-11d2-aa0d-00e098032b8c 2>/dev/null | tr -d ' ')
+      if [ \"\$sb\" != 1 ]; then
+        echo \"Secure Boot ist noch aus, TPM2 wird beim nächsten Start mit Secure Boot angemeldet.\"
+        exit 0
+      fi
+      for u in $LUKS_UUID${LUKS2_UUID:+ $LUKS2_UUID}; do
+        systemd-cryptenroll --unlock-key-file=/var/lib/luks-tpm2/einmal.key --wipe-slot=tpm2 --tpm2-device=auto --tpm2-pcrs=7 /dev/disk/by-uuid/\$u
+        cryptsetup luksRemoveKey /dev/disk/by-uuid/\$u /var/lib/luks-tpm2/einmal.key
+      done
+      shred -u /var/lib/luks-tpm2/einmal.key
+      echo \"TPM2 angemeldet, der Rechner startet jetzt ohne LUKS-Passwort.\"
+    '';
+  };"
 fi
 
 VPN_NIX=""
@@ -1567,6 +1778,7 @@ PKG_NIX+='
   emit "Silent Boot"                        "$SILENT_NIX"
   emit "Laptop: Energie und Deckel"          "$POWER_NIX"
   emit "Verschlüsselung"                     "$LUKS_NIX"
+  emit "Entsperren beim Start (SSH, TPM2)"   "$UNLOCK_NIX"
   emit "btrfs-Mount-Optionen (ergänzen subvol=... aus hardware-configuration.nix)" "$FS_NIX"
   emit "Swap"                                "$SWAP_NIX"
   emit "Snapshots für /home"                 "$SNAP_NIX"
@@ -1640,7 +1852,7 @@ fi
 for cmd in parted partprobe wipefs blkid mkfs.fat mkfs.ext4 mkfs.btrfs btrfs cryptsetup curl nix-channel nix-instantiate nix-shell nixos-generate-config nixos-install nixos-enter udevadm; do
   command -v "$cmd" >/dev/null || die "'$cmd' fehlt. Läuft das Skript im NixOS-Installer?"
 done
-ping -c1 -W3 cache.nixos.org >/dev/null 2>&1 || warn "Keine Verbindung zu cache.nixos.org. WLAN mit 'nmtui' einrichten."
+curl -fsI --max-time 8 https://cache.nixos.org/nix-cache-info >/dev/null 2>&1 || warn "Keine Verbindung zu cache.nixos.org. WLAN mit 'nmtui' einrichten."
 
 # Feste Suchpfade, damit <nixpkgs> auch bei "sudo bash" auf den root-Kanal zeigt
 export NIX_PATH="nixpkgs=/nix/var/nix/profiles/per-user/root/channels/nixos:/nix/var/nix/profiles/per-user/root/channels"
@@ -1668,12 +1880,21 @@ done
 if grep -q GenuineIntel /proc/cpuinfo; then CPU_INTEL=1; else CPU_INTEL=0; fi
 if systemd-detect-virt -q 2>/dev/null; then IS_VM=1; else IS_VM=0; fi
 LUKS_UUID=""; LUKS2_UUID=""; RESUME_UUID=""; RESUME_OFFSET=0; AVAHI_SETTINGS=0
+DEF_KB=""; DEF_LOCALE=""; DEF_TZ=""; SB_DONE=0; SSH_UNLOCK_MODS=""
+# Proxy des Live-Systems (z. B. Schulnetz) auch im neuen System verwenden
+LIVE_PROXY=${https_proxy:-${HTTPS_PROXY:-${http_proxy:-${HTTP_PROXY:-}}}}
+if [[ -n $LIVE_PROXY && ! $LIVE_PROXY =~ ^https?://[A-Za-z0-9._:@%-]+/?$ ]]; then
+  warn "Proxy-Angabe nicht verwertbar, wird nicht übernommen: $LIVE_PROXY"; LIVE_PROXY=""
+fi
+if [[ -n ${EXTRA_CA-} ]]; then
+  grep -q 'BEGIN CERTIFICATE' "$EXTRA_CA" 2>/dev/null || die "EXTRA_CA ist kein PEM-Zertifikat: $EXTRA_CA"
+fi
 XBOOT=0; WINDOWS=0; DB_MIN_GB=${DB_MIN_GB:-20}; DATA_PART=${DATA_PART-}; DATA_FSTYPE=""
 
 # Menüs mit dialog, wenn ein Terminal da ist (TUI=n schaltet sie ab)
 if [[ ${TUI:-j} != [nN]* && -t 0 ]] && [[ -r /dev/tty ]] && (( ! AUTO_MODE )); then
   echo "  Lade dialog für die Menüs ..."
-  DIALOG_BIN=$(nix-build '<nixpkgs>' -A dialog --no-out-link 2>/dev/null)/bin/dialog || true
+  DIALOG_BIN=$(tool_bin dialog dialog)
   if [[ -x $DIALOG_BIN ]]; then USE_DIALOG=1; else warn "dialog nicht verfügbar, frage im Textmodus."; fi
 fi
 
@@ -1720,6 +1941,23 @@ done < <(lsblk -dpno NAME,SIZE,MODEL -e 7,11 | while read -r n rest; do
 done)
 (( ${#DISK_OPTS[@]} > 0 )) || die "Keine passende Platte gefunden."
 
+# DISK=auto: die einzige interne Platte (nicht USB, nicht wechselbar)
+if [[ ${DISK-} == auto ]]; then
+  cands=()
+  for o in "${DISK_OPTS[@]}"; do
+    d=${o%%|*}
+    if [[ $(lsblk -dno RM "$d" | tr -d ' ') == 0 && $(lsblk -dno TRAN "$d" | tr -d ' ') != usb ]]; then cands+=("$d"); fi
+  done
+  if (( ${#cands[@]} == 1 )); then
+    DISK=${cands[0]}
+    echo "  Zielplatte automatisch gewählt: $DISK ($(lsblk -dno SIZE,MODEL "$DISK" | xargs))"
+  elif (( AUTO_MODE )); then
+    die "DISK=auto: ${#cands[@]} interne Platten gefunden (${cands[*]}). Bitte DISK angeben."
+  else
+    unset DISK
+  fi
+fi
+
 if [[ $INSTALL_MODE == dualboot ]]; then
   choose DISK "Auf welche Platte? (vorhandene Partitionen bleiben, NixOS kommt in den freien Platz)" 1 "${DISK_OPTS[@]}"
 else
@@ -1735,6 +1973,10 @@ for m in / /nix /nix/store /iso; do
     die "$DISK enthält $m des laufenden Systems."
   fi
 done
+
+SMARTCTL=""
+if (( ! IS_VM )); then SMARTCTL=$(tool_bin smartctl smartmontools); fi
+check_disk_health "$DISK" DISK_FORCE
 
 if [[ $INSTALL_MODE == dualboot ]]; then
   dualboot_plan
@@ -1782,6 +2024,7 @@ if [[ $DISK2_MODE != none ]]; then
   if [[ $DISK2_MODE == raid1 ]]; then
     note "RAID1: Ein Swapfile ist auf btrfs mit zwei Platten nicht möglich, es gibt nur zram. Die Boot-Partition liegt nur auf $DISK."
   fi
+  check_disk_health "$DISK2" DISK2_FORCE
 fi
 
 # ---------- Version ----------
@@ -1799,7 +2042,13 @@ case $CHANNEL in
 esac
 
 # ---------- 2. Tastaturlayout ----------
-choose KB "Welches Tastaturlayout?" 1 \
+if [[ -z ${KB-} || -z ${LOCALE-} || -z ${TIMEZONE-} ]]; then
+  detect_live_defaults
+  if [[ -n $DEF_KB$DEF_LOCALE$DEF_TZ ]]; then
+    echo "  Erkannt (Live-System bzw. Standort): Tastatur ${DEF_KB:-?}, Sprache ${DEF_LOCALE:-?}, Zeitzone ${DEF_TZ:-?}"
+  fi
+fi
+with_default "$DEF_KB" \
   "de|Deutsch" \
   "de:nodeadkeys|Deutsch, ohne Tottasten" \
   "at|Österreich" \
@@ -1809,6 +2058,7 @@ choose KB "Welches Tastaturlayout?" 1 \
   "gb|Englisch (UK)" \
   "fr|Französisch" \
   "custom|Anderes (xkb-Layout selbst eingeben)"
+choose KB "Welches Tastaturlayout?" "$DEF_IDX" "${CHOICES[@]}"
 if [[ $KB == custom ]]; then
   unset KB
   ask KB "xkb-Layout[:Variante], z. B. es oder us:dvorak"
@@ -1831,7 +2081,7 @@ if [[ $(tty 2>/dev/null) == /dev/tty* ]]; then
 fi
 
 # ---------- 3. Sprache ----------
-choose LOCALE "Welche Systemsprache?" 1 \
+with_default "$DEF_LOCALE" \
   "de_DE.UTF-8|Deutsch (Deutschland)" \
   "de_AT.UTF-8|Deutsch (Österreich)" \
   "de_CH.UTF-8|Deutsch (Schweiz)" \
@@ -1839,6 +2089,7 @@ choose LOCALE "Welche Systemsprache?" 1 \
   "en_GB.UTF-8|Englisch (UK)" \
   "en_US.UTF-8+de_DE.UTF-8|Englisch, aber deutsche Formate (Datum, Zahlen, Papier)" \
   "custom|Andere (Locale selbst eingeben)"
+choose LOCALE "Welche Systemsprache?" "$DEF_IDX" "${CHOICES[@]}"
 if [[ $LOCALE == custom ]]; then
   unset LOCALE
   ask LOCALE "Locale, z. B. fr_FR.UTF-8"
@@ -1850,7 +2101,7 @@ FORMAT_LOCALE=""
 [[ $LOCALE == *+* ]] && FORMAT_LOCALE=${LOCALE#*+}
 
 # ---------- Zeitzone ----------
-ask TIMEZONE "Zeitzone (z. B. Europe/Berlin, Europe/Vienna, Europe/Zurich)" "Europe/Berlin" \
+ask TIMEZONE "Zeitzone (z. B. Europe/Berlin, Europe/Vienna, Europe/Zurich)" "${DEF_TZ:-Europe/Berlin}" \
   '^[A-Za-z_]+(/[A-Za-z0-9_+-]+)*$' "Ungültige Zeitzone, Form: Kontinent/Stadt"
 if [[ -d /etc/zoneinfo && ! -f /etc/zoneinfo/$TIMEZONE ]]; then die "Unbekannte Zeitzone: $TIMEZONE"; fi
 
@@ -2010,9 +2261,17 @@ else
   if is_yes "${UKI:-n}"; then note "UKI gibt es nur mit UEFI und einer EFI-Partition ab 1 GiB, wird übersprungen."; fi
   UKI=0
 fi
+if (( UKI )) && [[ $(efi_var SetupMode) == 1 ]]; then
+  ask_yn SB_ENROLL "Die Firmware ist im Setup Mode. Secure-Boot-Schlüssel gleich bei der Installation eintragen? (mit Microsoft-Schlüsseln, Windows und Zusatzkarten starten weiter)" j
+else
+  if (( UKI )) && is_yes "${SB_ENROLL:-n}"; then
+    note "Die Firmware ist nicht im Setup Mode, die Secure-Boot-Schlüssel werden nach dem ersten Start eingetragen (Anleitung am Ende)."
+  fi
+  SB_ENROLL=0
+fi
 TPM2=${TPM2:-}
 if (( ENCRYPT && UKI )) && [[ $(cat /sys/class/tpm/tpm0/tpm_version_major 2>/dev/null) == 2 ]]; then
-  ask_yn TPM2 "LUKS per TPM2 entsperren vorbereiten? (nach Secure Boot kein Passwort mehr, Passwort bleibt als Rückfall)" j
+  ask_yn TPM2 "LUKS per TPM2 entsperren? (meldet sich beim ersten Start mit Secure Boot selbst an, Passwort bleibt als Rückfall)" j
 else
   TPM2=0
 fi
@@ -2170,6 +2429,31 @@ elif [[ $VPN == wireguard ]]; then
     || die "$WG_CONF sieht nicht nach einer wg-quick-Konfiguration aus ([Interface] mit PrivateKey fehlt)."
 fi
 
+# ---------- LUKS per SSH entsperren ----------
+if (( ENCRYPT && SSHD )) && [[ -n $SSH_KEYS_NIX ]]; then
+  if [[ $DESKTOP == none ]]; then def=j; else def=n; fi
+  ask_yn SSH_UNLOCK "Verschlüsselung beim Start auch per SSH entsperren? (ssh -p 2222 root@$(if [[ $NET_MODE == static ]]; then echo "${NET_ADDR%/*}"; else echo "<rechner>"; fi), nur über Kabel)" "$def"
+else
+  if is_yes "${SSH_UNLOCK:-n}"; then note "SSH-Entsperren braucht Verschlüsselung und SSH mit Schlüssel, wird übersprungen."; fi
+  SSH_UNLOCK=0
+fi
+if (( SSH_UNLOCK )); then
+  if [[ $NET_MODE == static ]]; then
+    SSH_UNLOCK_MODS=$(nic_modules "$NET_IF" | paste -sd' ' -)
+  else
+    SSH_UNLOCK_MODS=$(nic_modules | paste -sd' ' -)
+  fi
+  wired=0
+  for n in /sys/class/net/*; do
+    if [[ -e $n/device && ! -d $n/wireless ]]; then wired=1; fi
+  done
+  if (( ! wired )); then
+    note "Keine Netzwerkkarte mit Kabel gefunden. SSH-Entsperren geht nur über Kabel (ggf. USB-Adapter, Treiber in boot.initrd.availableKernelModules)."
+  fi
+  re_mod='^[a-z0-9_ -]*$'
+  [[ $SSH_UNLOCK_MODS =~ $re_mod ]] || die "Unerwarteter Treibername: $SSH_UNLOCK_MODS"
+fi
+
 # ---------- WLAN übernehmen ----------
 mapfile -t WIFI_FILES < <(wifi_files)
 if [[ $NET_MODE != static ]] && (( ${#WIFI_FILES[@]} > 0 )); then
@@ -2230,9 +2514,9 @@ case $KERNEL in
 esac
 
 if (( AUTO_MODE )); then
-  [[ ${CONFIRM_DISK-} == "$DISK" ]] || die "Automatikmodus: CONFIRM_DISK muss $DISK sein (Schutz vor versehentlichem Löschen)."
+  [[ ${CONFIRM_DISK-} == "$DISK" || ${CONFIRM_DISK-} == auto ]] || die "Automatikmodus: CONFIRM_DISK muss $DISK sein (Schutz vor versehentlichem Löschen)."
   if [[ $DISK2_MODE == raid1 || $DISK2_MODE == data ]]; then
-    [[ ${CONFIRM_DISK2-} == "$DISK2" ]] || die "Automatikmodus: CONFIRM_DISK2 muss $DISK2 sein."
+    [[ ${CONFIRM_DISK2-} == "$DISK2" || ${CONFIRM_DISK2-} == auto ]] || die "Automatikmodus: CONFIRM_DISK2 muss $DISK2 sein."
   fi
   [[ -n ${USER_PASS-}${USER_HASH-} ]] || die "Automatikmodus: USER_PASS oder USER_HASH muss in der Passwortdatei stehen."
   [[ -z $EXTRA_USERS || -n ${EXTRA_PASS-}${EXTRA_HASH-} ]] || die "Automatikmodus: EXTRA_PASS oder EXTRA_HASH fehlt für die weiteren Benutzer."
@@ -2272,6 +2556,7 @@ fi
 info "Prüfe die Konfiguration, bevor etwas gelöscht wird (dauert etwas)"
 PRE=$(mktemp -d /tmp/nixos-vorab.XXXXXX)
 write_mock_hw > "$PRE/hardware-configuration.nix"
+if [[ -n ${EXTRA_CA-} ]]; then cp "$EXTRA_CA" "$PRE/ca.pem"; fi
 LUKS_UUID=00000000-0000-0000-0000-000000000000
 if [[ $DISK2_MODE == raid1 || $DISK2_MODE == data ]]; then LUKS2_UUID=00000000-0000-0000-0000-000000000000; fi
 RESUME_UUID=00000000-0000-0000-0000-000000000000
@@ -2313,7 +2598,7 @@ $(case $DISK2_MODE in
     keep)  echo "  Zweite Platte:  $DATA_PART ($DATA_FSTYPE) bleibt erhalten, unter /data" ;;
   esac)
   Version:        $CHANNEL_NAME
-  Bootloader:     $( if [[ $BOOT_MODE == bios ]]; then echo "GRUB, Legacy-BIOS ($GRUB_DEV)"; elif (( UKI )); then echo "UKI via lanzaboote (Secure-Boot-Schlüssel werden erzeugt)"; else echo "systemd-boot (UEFI)"; fi )
+  Bootloader:     $( if [[ $BOOT_MODE == bios ]]; then echo "GRUB, Legacy-BIOS ($GRUB_DEV)"; elif (( UKI && SB_ENROLL )); then echo "UKI via lanzaboote, Secure-Boot-Schlüssel werden in die Firmware eingetragen"; elif (( UKI )); then echo "UKI via lanzaboote (Secure-Boot-Schlüssel werden erzeugt)"; else echo "systemd-boot (UEFI)"; fi )
   Kernel:         $(if [[ $KERNEL == latest ]]; then echo "neuester stabiler (linuxPackages_latest)"; else echo "Standard des Releases (linuxPackages)"; fi)
   Silent Boot:    $(yn "$SILENT")$(if (( SILENT )); then echo " (Plymouth)"; fi)
   Tastatur:       $XKB_LAYOUT${XKB_VARIANT:+ ($XKB_VARIANT)}
@@ -2331,7 +2616,7 @@ $(case $DISK2_MODE in
   Audio:          PipeWire (ALSA + 32 bit, Pulse, JACK)
   Flatpak:        $(yn "$FLATPAK")$(if (( FLATPAK )); then echo " (Flathub)"; fi)
   Unfree:         $(yn "$UNFREE")
-  Verschlüsselt:  $(yn "$ENCRYPT")$(if (( TPM2 )); then echo " (TPM2 vorbereitet)"; fi)
+  Verschlüsselt:  $(yn "$ENCRYPT")$(if (( TPM2 )); then echo ", TPM2 beim ersten Start mit Secure Boot"; fi)$(if (( SSH_UNLOCK )); then echo ", entsperren per SSH (Port 2222)"; fi)
   YubiKey/FIDO2:  Verschlüsselung $(yn "$FIDO2_LUKS"), sudo $(yn "$FIDO2_SUDO")
   Bootmenü:       $(if (( RESCUE )) && [[ $BOOT_MODE == bios ]]; then echo "mit Memtest86+"; elif (( RESCUE )); then echo "mit Memtest86+ und netboot.xyz"; elif (( UKI )); then echo "UKI (ohne Rettungseinträge)"; else echo "ohne Rettungseinträge"; fi)
   Snapshots:      $(yn "$SNAPPER")$(if (( SNAPPER )); then echo " (/home, snapper)"; fi)
@@ -2345,7 +2630,7 @@ $(case $DISK2_MODE in
   Benutzer:       $NIX_USER (Admin)${EXTRA_USERS:+, $EXTRA_USERS}
   Swap:           ${SWAP_GB} GiB Swapfile$(if (( ZRAM )); then echo " + zram"; fi)
   SSH:            $(yn "$SSHD")$(if (( SSHD )); then if [[ -n $SSH_KEYS_NIX ]]; then echo " ($(grep -c . <<<"$SSH_KEYS_NIX") Schlüssel)"; else echo " (noch ohne Schlüssel)"; fi; fi)$(if (( FAIL2BAN )); then echo ", fail2ban"; fi)
-  Netzwerk:       $(if [[ $NET_MODE == static ]]; then echo "fest: $NET_IF $NET_ADDR, Gateway $NET_GW, DNS $NET_DNS${NET_ADDR6:+, $NET_ADDR6}"; else echo "automatisch (NetworkManager)$(if (( WIFI_COPY )); then echo ", WLAN wird übernommen"; fi)"; fi)
+  Netzwerk:       $(if [[ $NET_MODE == static ]]; then echo "fest: $NET_IF $NET_ADDR, Gateway $NET_GW, DNS $NET_DNS${NET_ADDR6:+, $NET_ADDR6}"; else echo "automatisch (NetworkManager)$(if (( WIFI_COPY )); then echo ", WLAN wird übernommen"; fi)"; fi)${LIVE_PROXY:+, Proxy $LIVE_PROXY}
   VPN:            $(case $VPN in none) echo nein ;; tailscale) echo "Tailscale$(if [[ -n ${TS_AUTHKEY-} ]]; then echo " (meldet sich automatisch an)"; fi)" ;; wireguard) echo "WireGuard wg0 aus $WG_CONF" ;; esac)
 EOF
 )
@@ -2366,8 +2651,32 @@ confirm_disk() {
   [[ $answer == "$dev" ]] || die "Abgebrochen, nichts verändert."
 }
 
+# Countdown für CONFIRM_DISK=auto: jede Taste bricht ab
+countdown() {
+  local n=${AUTO_WARTEN:-30} k
+  [[ $n =~ ^[0-9]+$ ]] || n=30
+  warn "$1"
+  if { : </dev/tty; } 2>/dev/null; then
+    echo "  Abbrechen: beliebige Taste drücken." >/dev/tty
+    while (( n > 0 )); do
+      printf '\r  Start in %3d s ' "$n" >/dev/tty
+      if read -rsn1 -t1 k </dev/tty; then echo >/dev/tty; die "Abgebrochen, nichts verändert."; fi
+      n=$((n - 1))
+    done
+    echo >/dev/tty
+  else
+    sleep "$n"
+  fi
+}
+
 if (( AUTO_MODE )); then
-  echo "  Automatikmodus: Bestätigung über CONFIRM_DISK=$CONFIRM_DISK${CONFIRM_DISK2:+, CONFIRM_DISK2=$CONFIRM_DISK2}"
+  if [[ ${CONFIRM_DISK-} == auto || ${CONFIRM_DISK2-} == auto ]]; then
+    if [[ $INSTALL_MODE == dualboot ]]; then what="$DISK bekommt neue Partitionen im freien Bereich"; else what="ALLE Daten auf $DISK ($(lsblk -dno SIZE,MODEL "$DISK" | xargs)) werden gelöscht"; fi
+    if [[ $DISK2_MODE == raid1 || $DISK2_MODE == data ]]; then what+=", ebenso auf $DISK2"; fi
+    countdown "$what."
+  else
+    echo "  Automatikmodus: Bestätigung über CONFIRM_DISK=$CONFIRM_DISK${CONFIRM_DISK2:+, CONFIRM_DISK2=$CONFIRM_DISK2}"
+  fi
 else
   if (( USE_DIALOG )); then
     dlg --title "Zusammenfassung (Pfeiltasten blättern)" --cr-wrap --no-collapse \
@@ -2474,7 +2783,7 @@ if [[ $INSTALL_MODE == dualboot ]]; then
   fi
 elif [[ $BOOT_MODE == uefi ]]; then
   info "Formatiere EFI-Partition"
-  mkfs.fat -F 32 -n boot "$BOOTPART" >/dev/null
+  mkfs.fat -F 32 -n BOOT "$BOOTPART" >/dev/null 2>&1
 else
   info "Formatiere /boot"
   mkfs.ext4 -q -F -L boot "$BOOTPART"
@@ -2590,6 +2899,7 @@ if (( ENCRYPT )) && ! grep -q 'luks.devices."cryptroot"' "$HW"; then
 fi
 
 mv "$CFG" "$CFG.generated"
+if [[ -n ${EXTRA_CA-} ]]; then install -m 644 "$EXTRA_CA" /mnt/etc/nixos/ca.pem; fi
 build_config "$CFG"
 
 
@@ -2605,10 +2915,20 @@ if (( EDIT_CFG )); then "${EDITOR:-nano}" "$CFG" </dev/tty >/dev/tty 2>&1; fi
 if (( UKI )); then
   info "Erzeuge Secure-Boot-Schlüssel für lanzaboote"
   rm -rf /var/lib/sbctl
-  nix-shell -p sbctl --run "sbctl create-keys"
+  SBCTL=$(tool_bin sbctl sbctl)
+  [[ -n $SBCTL ]] || die "sbctl ist nicht verfügbar (Netzwerk?)."
+  "$SBCTL" create-keys
   mkdir -p /mnt/var/lib
   cp -a /var/lib/sbctl /mnt/var/lib/
   [[ -f /mnt/var/lib/sbctl/keys/db/db.key ]] || die "Schlüssel fehlen unter /mnt/var/lib/sbctl."
+fi
+
+if (( SSH_UNLOCK )); then
+  info "Erzeuge den SSH-Schlüssel für das Entsperren beim Start"
+  install -d -m 700 /mnt/etc/secrets/initrd
+  rm -f /mnt/etc/secrets/initrd/ssh_host_ed25519_key /mnt/etc/secrets/initrd/ssh_host_ed25519_key.pub
+  ssh-keygen -q -t ed25519 -N "" -C "initrd@$NIX_HOSTNAME" -f /mnt/etc/secrets/initrd/ssh_host_ed25519_key
+  UNLOCK_FP=$(ssh-keygen -lf /mnt/etc/secrets/initrd/ssh_host_ed25519_key.pub | awk '{print $2}')
 fi
 
 if (( UKI )); then
@@ -2632,6 +2952,46 @@ while ! nixos-install --no-root-passwd --channel "$CHANNELS_PATH"; do
     *)     die "Installation abgebrochen. Konfiguration: $CFG, eingehängt unter /mnt." ;;
   esac
 done
+
+# Secure Boot: nur eintragen, wenn alles Startrelevante mit dem eigenen Schlüssel signiert ist
+if (( SB_ENROLL )); then
+  info "Trage die Secure-Boot-Schlüssel in die Firmware ein"
+  SBVERIFY=$(tool_bin sbverify sbsigntool)
+  sb_ok=1
+  if [[ -z $SBVERIFY ]]; then
+    sb_ok=0; warn "sbverify nicht verfügbar, Signaturen lassen sich nicht prüfen."
+  else
+    shopt -s nullglob
+    sb_files=(/mnt/boot/EFI/BOOT/BOOT*.EFI /mnt/boot/EFI/systemd/systemd-boot*.efi /mnt/boot/EFI/Linux/*.efi)
+    shopt -u nullglob
+    if (( ${#sb_files[@]} < 3 )); then sb_ok=0; warn "Zu wenige signierte Dateien auf der EFI-Partition gefunden."; fi
+    for f in "${sb_files[@]}"; do
+      if "$SBVERIFY" --cert /var/lib/sbctl/keys/db/db.pem "$f" >/dev/null 2>&1; then
+        echo "  signiert: ${f#/mnt}"
+      else
+        sb_ok=0; warn "Nicht mit dem eigenen Schlüssel signiert: ${f#/mnt}"
+      fi
+    done
+  fi
+  if (( sb_ok )); then   # schreibgeschützte Firmware-Variablen freigeben (macht sbctl meist selbst)
+    for v in PK KEK db dbx; do chattr -i /sys/firmware/efi/efivars/"$v"-* 2>/dev/null || true; done
+  fi
+  if (( sb_ok )) && "$SBCTL" enroll-keys --microsoft; then
+    SB_DONE=1
+    echo "  Schlüssel eingetragen (eigene + Microsoft)."
+  else
+    warn "Secure-Boot-Schlüssel nicht eingetragen. Nach dem ersten Start von Hand (Anleitung am Ende)."
+  fi
+fi
+
+if (( TPM2 )); then
+  # Einmaliger Schlüssel auf der verschlüsselten Platte: damit meldet sich TPM2 beim ersten Start mit Secure Boot an
+  install -d -m 700 /mnt/var/lib/luks-tpm2
+  ( umask 077; head -c 64 /dev/urandom > /mnt/var/lib/luks-tpm2/einmal.key )
+  for dev in "$ROOTPART" ${D2PART:+"$D2PART"}; do
+    printf '%s' "$LUKS_PASS" | cryptsetup luksAddKey --batch-mode --key-file=- "$dev" /mnt/var/lib/luks-tpm2/einmal.key
+  done
+fi
 
 # Kanal-Liste für spätere Updates (nix-channel --update) im neuen System
 install -d -m 700 /mnt/root
@@ -2740,7 +3100,9 @@ fi
 
 if (( FIDO2_SUDO )); then
   info "YubiKey/FIDO2 für sudo: Schlüssel einstecken, ggf. PIN eingeben und antippen, wenn er blinkt"
-  until U2F_LINE=$(nix-shell -p pam_u2f --run "pamu2fcfg -u $NIX_USER -o pam://$NIX_HOSTNAME -i pam://$NIX_HOSTNAME" </dev/tty) \
+  PAMU2FCFG=$(tool_bin pamu2fcfg pam_u2f)
+  [[ -n $PAMU2FCFG ]] || PAMU2FCFG=pamu2fcfg
+  until U2F_LINE=$("$PAMU2FCFG" -u "$NIX_USER" -o "pam://$NIX_HOSTNAME" -i "pam://$NIX_HOSTNAME" </dev/tty) \
         && [[ $U2F_LINE == "$NIX_USER:"* ]]; do
     if ! key_retry "Das Einrichten des Schlüssels für sudo"; then
       U2F_LINE=""
@@ -2774,7 +3136,15 @@ if [[ $SAMBA == server ]]; then
 fi
 
 info "Installation abgeschlossen."
-if (( UKI )); then
+if (( SB_DONE )); then
+  echo "  Secure Boot: Die Schlüssel sind in der Firmware eingetragen. Nach dem Neustart prüfen: bootctl status"
+  echo "    Ist Secure Boot im Firmware-Setup noch aus, dort einschalten."
+  echo "    Achtung: Der NixOS-Stick startet mit Secure Boot nicht mehr, dafür Secure Boot kurz ausschalten."
+  if (( TPM2 )); then
+    echo "  TPM2 meldet sich beim ersten Start mit Secure Boot selbst an, danach startet der Rechner ohne LUKS-Passwort."
+    echo "    Nach Firmware-Updates fragt er evtl. wieder nach dem Passwort; dann: sudo luks-tpm2-enroll"
+  fi
+elif (( UKI )); then
   cat <<'EOF'
   Secure Boot ist vorbereitet, aber noch nicht aktiv. Nach dem ersten Start:
     1. sudo sbctl verify
@@ -2789,9 +3159,9 @@ if (( UKI )); then
 EOF
   if (( TPM2 )); then
     cat <<'EOF'
-    5. sudo luks-tpm2-enroll       -> LUKS-Passwort einmal eingeben, danach entsperrt der TPM
-       Nach Firmware-Updates oder geänderten Secure-Boot-Schlüsseln fragt der Start wieder
-       nach dem Passwort; dann luks-tpm2-enroll erneut ausführen.
+    5. TPM2 meldet sich beim nächsten Start mit Secure Boot selbst an, danach kein LUKS-Passwort mehr.
+       Nach Firmware-Updates oder geänderten Secure-Boot-Schlüsseln fragt der Start evtl. wieder
+       nach dem Passwort; dann: sudo luks-tpm2-enroll
 EOF
   fi
 fi
@@ -2836,6 +3206,10 @@ fi
 if [[ $DISK2_MODE == raid1 ]]; then
   echo "  RAID1: Fällt eine Platte aus, startet das System nicht von selbst. Dann vom Stick starten und mit"
   echo "    'mount -o degraded' einhängen, Ersatz mit 'btrfs replace' einbauen."
+fi
+if (( SSH_UNLOCK )); then
+  echo "  Entsperren beim Start: ssh -p 2222 root@$(if [[ $NET_MODE == static ]]; then echo "${NET_ADDR%/*}"; else echo "$NIX_HOSTNAME"; fi), dann das LUKS-Passwort eingeben"
+  echo "    Fingerabdruck des Start-Schlüssels: ${UNLOCK_FP:-?}"
 fi
 if [[ $VPN == tailscale && -z ${TS_AUTHKEY-} ]]; then
   echo "  Tailscale anmelden: sudo tailscale up"
