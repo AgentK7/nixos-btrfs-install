@@ -2,7 +2,7 @@
 
 Interaktives Installer-Skript für NixOS auf btrfs, wahlweise aktuelles Release oder unstable.
 
-Im NixOS-Live-System (UEFI, Secure Boot aus) als root:
+Im NixOS-Live-System als root (UEFI mit ausgeschaltetem Secure Boot oder Legacy-BIOS):
 
 ```bash
 curl -L is.gd/B1rzoc -o i.sh && sudo bash i.sh
@@ -35,7 +35,9 @@ Die Datei wird nur gelesen, nicht ausgeführt. Hostname, Grafik und Swap-Größe
 
 ## Was es einrichtet
 
-- GPT: 1 GiB EFI-Partition (`/boot`), Rest btrfs, optional in LUKS2
+- UEFI: GPT mit 1 GiB EFI-Partition (`/boot`), systemd-boot oder UKI
+- Legacy-BIOS (automatisch erkannt, erzwingbar mit `BOOT_MODE=bios`): GPT mit BIOS-Boot-Partition für GRUB und 1 GiB `/boot` (ext4)
+- Rest btrfs, optional in LUKS2
 - Subvolumes `@`, `@home`, `@nix`, `@log`, `@swap` mit `compress=zstd,noatime`, optional snapper-Snapshots für `/home`
 - systemd-boot oder UKI über [lanzaboote](https://github.com/nix-community/lanzaboote) v1.2.0, optional TPM2-Entsperren für LUKS
 - Neuester stabiler Kernel (`KERNEL=lts` für den Standard-Kernel), bei NVIDIA auf Wunsch LTS
@@ -46,7 +48,7 @@ Die Datei wird nur gelesen, nicht ausgeführt. Hostname, Grafik und Swap-Größe
 - Laptops: Ruhezustand (Swapfile und resume-Offset automatisch), Verhalten beim Zuklappen, Energieprofile, thermald auf Intel
 - Swapfile plus zram, btrfs-Scrub, Store-Optimierung, fwupd, smartd (Warnung bei sterbenden Platten)
 - Wöchentliches Aufräumen alter Generationen (`nh clean`, die letzten 10 bleiben)
-- Rettungseinträge im Bootmenü: Memtest86+ und netboot.xyz (mit systemd-boot)
+- Rettungseinträge im Bootmenü: Memtest86+ und netboot.xyz (systemd-boot) bzw. Memtest86+ (GRUB)
 - Backup von `/home` mit restic auf einen anderen Rechner (SFTP, REST-Server, S3 …), täglich
 - VMs (libvirt, virt-manager), Container (Podman oder Docker)
 - PipeWire mit ALSA (inkl. 32 bit), PulseAudio und JACK

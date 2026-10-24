@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
 # NixOS (aktuelles Release oder unstable) auf btrfs installieren
-#   UEFI + systemd-boot oder UKI via lanzaboote, ESP >= 1 GiB, Rest btrfs (optional in LUKS2)
+#   UEFI: systemd-boot oder UKI via lanzaboote, EFI-Partition >= 1 GiB
+#   Legacy-BIOS: GRUB, BIOS-Boot-Partition + /boot (ext4) >= 1 GiB
+#   Rest btrfs (optional in LUKS2)
 #   Subvolumes @ @home @nix @log @swap, zstd, Swapfile, PipeWire (ALSA/32 bit, Pulse, JACK)
 #
 # Aufruf im NixOS-Live-System als root:
@@ -33,7 +35,8 @@
 #   Ja/Nein (j/n): PRINTING BLUETOOTH STEAM LIBVIRT FLATPAK UNFREE ENCRYPT UKI TPM2 SILENT
 #                  SNAPPER BACKUP HIBERNATE AUTOUPDATE OHMYZSH SSHD NV_OPEN FINGERPRINT
 #                  FIDO2_LUKS FIDO2_SUDO RESCUE HOME_MANAGER
-# Ohne Abfrage, nur per Variable: ESP_GB (1), COMPRESS (zstd), ZRAM (j),
+# Ohne Abfrage, nur per Variable: ESP_GB (Größe von /boot in GiB, 1), COMPRESS (zstd), ZRAM (j),
+#   BOOT_MODE (uefi | bios; Standard: wie der USB-Stick gestartet wurde),
 #   KERNEL (latest = neuester stabiler Kernel | lts = Standard-Kernel des Releases),
 #   TUI (j = Menüs mit dialog, n = reine Textabfragen)
 #
@@ -502,7 +505,7 @@ reread_partitions() {
     udevadm settle
     partprobe "$disk" 2>/dev/null || partx -u "$disk" 2>/dev/null || blockdev --rereadpt "$disk" 2>/dev/null || true
     udevadm settle
-    if [[ -b $ESP && -b $ROOTPART ]] && [[ $(lsblk -bdno SIZE "$ESP") == "$want_esp" ]]; then
+    if [[ -b $BOOTPART && -b $ROOTPART ]] && [[ $(lsblk -bdno SIZE "$BOOTPART") == "$want_esp" ]]; then
       return 0
     fi
     sleep 1
@@ -573,7 +576,11 @@ write_mock_hw() {
   if (( SWAP_GB > 0 )); then
     printf '  fileSystems."/swap" = { device = "%s"; fsType = "btrfs"; options = [ "subvol=@swap" ]; };\n' "$dev"
   fi
-  echo '  fileSystems."/boot" = { device = "/dev/disk/by-label/boot"; fsType = "vfat"; };'
+  if [[ $BOOT_MODE == uefi ]]; then
+    echo '  fileSystems."/boot" = { device = "/dev/disk/by-label/boot"; fsType = "vfat"; };'
+  else
+    echo '  fileSystems."/boot" = { device = "/dev/disk/by-label/boot"; fsType = "ext4"; };'
+  fi
   if (( ENCRYPT )); then
     echo '  boot.initrd.luks.devices."cryptroot".device = "/dev/disk/by-uuid/00000000-0000-0000-0000-000000000000";'
   fi
@@ -605,6 +612,17 @@ in
     enable = true;
     pkiBundle = "/var/lib/sbctl";  # Secure-Boot-Schlüssel, vom Installer erzeugt
   };'
+elif [[ $BOOT_MODE == bios ]]; then
+  HEADER_NIX='{ config, lib, pkgs, ... }:
+{'
+  BOOT_NIX="  boot.loader.grub = {
+    enable = true;
+    device = \"$GRUB_DEV\";  # Legacy-BIOS: GRUB in den Bootsektor dieser Platte
+    configurationLimit = 10;
+  };"
+  if (( RESCUE )); then
+    BOOT_NIX+=$'\n  boot.loader.grub.memtest86.enable = true;  # Eintrag „Memtest86+“: Arbeitsspeicher testen'
+  fi
 else
   HEADER_NIX='{ config, lib, pkgs, ... }:
 {'
@@ -1360,8 +1378,19 @@ if [[ -n ${ANTWORTEN:-} ]]; then
   info "Lese Antworten aus $ANTWORTEN"
   load_answers "$ANTWORTEN"
 fi
-[[ -d /sys/firmware/efi ]] || die "Kein UEFI-Boot erkannt. Den USB-Stick im UEFI-Modus starten."
-for cmd in parted partprobe wipefs mkfs.fat mkfs.btrfs btrfs cryptsetup curl nix-channel nix-instantiate nix-shell nixos-generate-config nixos-install nixos-enter udevadm; do
+# Startmodus: wie der USB-Stick gestartet wurde; BOOT_MODE=bios erzwingt GRUB für Legacy-BIOS
+if [[ -d /sys/firmware/efi ]]; then FW_MODE=uefi; else FW_MODE=bios; fi
+BOOT_MODE=${BOOT_MODE:-$FW_MODE}
+case $BOOT_MODE in
+  uefi) [[ $FW_MODE == uefi ]] || die "BOOT_MODE=uefi geht nur, wenn der USB-Stick im UEFI-Modus gestartet wurde." ;;
+  bios) ;;
+  *)    die "BOOT_MODE muss uefi oder bios sein." ;;
+esac
+if [[ $BOOT_MODE == bios ]]; then
+  info "Legacy-BIOS: Installation mit GRUB (ohne Secure Boot und UKI)"
+  if [[ $FW_MODE == uefi ]]; then warn "Der Stick wurde per UEFI gestartet, installiert wird trotzdem für Legacy-BIOS."; fi
+fi
+for cmd in parted partprobe wipefs mkfs.fat mkfs.ext4 mkfs.btrfs btrfs cryptsetup curl nix-channel nix-instantiate nix-shell nixos-generate-config nixos-install nixos-enter udevadm; do
   command -v "$cmd" >/dev/null || die "'$cmd' fehlt. Läuft das Skript im NixOS-Installer?"
 done
 ping -c1 -W3 cache.nixos.org >/dev/null 2>&1 || warn "Keine Verbindung zu cache.nixos.org. WLAN mit 'nmtui' einrichten."
@@ -1648,7 +1677,12 @@ echo "Audio: PipeWire mit ALSA (inkl. 32 bit), PulseAudio- und JACK-Unterstützu
 # ---------- Verschlüsselung und Bootloader ----------
 echo
 ask_yn ENCRYPT    "Datenträger mit LUKS verschlüsseln?" n
-ask_yn UKI        "UKI (Unified Kernel Image) über lanzaboote? Bereitet Secure Boot vor" n
+if [[ $BOOT_MODE == uefi ]]; then
+  ask_yn UKI      "UKI (Unified Kernel Image) über lanzaboote? Bereitet Secure Boot vor" n
+else
+  if is_yes "${UKI:-n}"; then note "UKI und Secure Boot gibt es nur mit UEFI, wird übersprungen."; fi
+  UKI=0
+fi
 TPM2=${TPM2:-}
 if (( ENCRYPT && UKI )) && [[ $(cat /sys/class/tpm/tpm0/tpm_version_major 2>/dev/null) == 2 ]]; then
   ask_yn TPM2 "LUKS per TPM2 entsperren vorbereiten? (nach Secure Boot kein Passwort mehr, Passwort bleibt als Rückfall)" j
@@ -1666,7 +1700,7 @@ ask_yn FIDO2_SUDO "YubiKey/FIDO2-Schlüssel für sudo$(if [[ $DESKTOP != none ]]
 
 # ---------- Weitere Optionen ----------
 if (( UKI )) || [[ $(uname -m) != x86_64 ]]; then
-  RESCUE=0   # Memtest86+ und netboot.xyz gibt es nur mit systemd-boot auf x86_64
+  RESCUE=0   # Memtest86+ und netboot.xyz gibt es nur mit systemd-boot bzw. GRUB auf x86_64
   ask_multi "Weitere Optionen" \
     UNFREE  "Unfreie Pakete erlauben (z. B. NVIDIA-Treiber, Steam)" j \
     SILENT  "Silent Boot (Plymouth-Startbildschirm, minimale Meldungen)" j \
@@ -1676,7 +1710,7 @@ else
     UNFREE  "Unfreie Pakete erlauben (z. B. NVIDIA-Treiber, Steam)" j \
     SILENT  "Silent Boot (Plymouth-Startbildschirm, minimale Meldungen)" j \
     SNAPPER "Automatische Snapshots für /home (snapper, stündlich, wird ausgedünnt)" j \
-    RESCUE  "Rettungseinträge im Bootmenü (Memtest86+, netboot.xyz)" j
+    RESCUE  "$(if [[ $BOOT_MODE == uefi ]]; then echo "Rettungseinträge im Bootmenü (Memtest86+, netboot.xyz)"; else echo "Memtest86+ im Bootmenü (Arbeitsspeicher testen)"; fi)" j
 fi
 if (( ! UNFREE )) && { [[ $GPU == nvidia || $GPU == nvidia-prime ]] || (( STEAM )); }; then
   note "NVIDIA-Treiber und Steam brauchen unfreie Pakete, Unfree wird aktiviert."
@@ -1769,9 +1803,22 @@ fi
 
 # nvme0n1 -> nvme0n1p1, sda -> sda1
 if [[ $DISK =~ [0-9]$ ]]; then P="${DISK}p"; else P="$DISK"; fi
-ESP="${P}1"
-ROOTPART="${P}2"
-ESP_END_MIB=$(( 1 + ESP_GB * 1024 ))   # Start bei 1 MiB, damit die ESP volle ESP_GB GiB hat
+if [[ $BOOT_MODE == uefi ]]; then
+  BOOTPART="${P}1"; ROOTPART="${P}2"; BOOT_START_MIB=1
+else
+  BIOSPART="${P}1"; BOOTPART="${P}2"; ROOTPART="${P}3"; BOOT_START_MIB=2   # 1 MiB BIOS-Boot davor
+fi
+BOOT_END_MIB=$(( BOOT_START_MIB + ESP_GB * 1024 ))   # /boot bekommt volle ESP_GB GiB
+
+# GRUB-Ziel: stabiler Name unter /dev/disk/by-id, bevorzugt Modell/Seriennummer statt WWN
+GRUB_DEV=$DISK
+for l in /dev/disk/by-id/*; do
+  [[ -e $l && $l != *-part* ]] || continue
+  if [[ $(readlink -f "$l") == "$(readlink -f "$DISK")" ]]; then
+    GRUB_DEV=$l
+    if [[ $l != */wwn-* && $l != */nvme-eui.* ]]; then break; fi
+  fi
+done
 
 case $KERNEL in
   latest) KERNEL_ATTR=linuxPackages_latest ;;
@@ -1833,10 +1880,15 @@ echo "  Konfiguration ist gültig."
 # ---------- Zusammenfassung ----------
 SUMMARY=$(cat <<EOF
   Datenträger:    $DISK
-    ${ESP}  ${ESP_GB} GiB FAT32 -> /boot
+$(if [[ $BOOT_MODE == uefi ]]; then
+    echo "    ${BOOTPART}  ${ESP_GB} GiB FAT32 -> /boot (EFI)"
+  else
+    echo "    ${BIOSPART}  1 MiB BIOS-Boot (für GRUB)"
+    echo "    ${BOOTPART}  ${ESP_GB} GiB ext4 -> /boot"
+  fi)
     ${ROOTPART}  Rest, $( if (( ENCRYPT )); then echo "LUKS2 -> btrfs"; else echo "btrfs"; fi ) ($COMPRESS)
   Version:        $CHANNEL_NAME
-  Bootloader:     $( if (( UKI )); then echo "UKI via lanzaboote (Secure-Boot-Schlüssel werden erzeugt)"; else echo "systemd-boot"; fi )
+  Bootloader:     $( if [[ $BOOT_MODE == bios ]]; then echo "GRUB, Legacy-BIOS ($GRUB_DEV)"; elif (( UKI )); then echo "UKI via lanzaboote (Secure-Boot-Schlüssel werden erzeugt)"; else echo "systemd-boot (UEFI)"; fi )
   Kernel:         $(if [[ $KERNEL == latest ]]; then echo "neuester stabiler (linuxPackages_latest)"; else echo "Standard des Releases (linuxPackages)"; fi)
   Silent Boot:    $(yn "$SILENT")$(if (( SILENT )); then echo " (Plymouth)"; fi)
   Tastatur:       $XKB_LAYOUT${XKB_VARIANT:+ ($XKB_VARIANT)}
@@ -1856,7 +1908,7 @@ SUMMARY=$(cat <<EOF
   Unfree:         $(yn "$UNFREE")
   Verschlüsselt:  $(yn "$ENCRYPT")$(if (( TPM2 )); then echo " (TPM2 vorbereitet)"; fi)
   YubiKey/FIDO2:  Verschlüsselung $(yn "$FIDO2_LUKS"), sudo $(yn "$FIDO2_SUDO")
-  Bootmenü:       $(if (( RESCUE )); then echo "mit Memtest86+ und netboot.xyz"; elif (( UKI )); then echo "UKI (ohne Rettungseinträge)"; else echo "ohne Rettungseinträge"; fi)
+  Bootmenü:       $(if (( RESCUE )) && [[ $BOOT_MODE == bios ]]; then echo "mit Memtest86+"; elif (( RESCUE )); then echo "mit Memtest86+ und netboot.xyz"; elif (( UKI )); then echo "UKI (ohne Rettungseinträge)"; else echo "ohne Rettungseinträge"; fi)
   Snapshots:      $(yn "$SNAPPER")$(if (( SNAPPER )); then echo " (/home, snapper)"; fi)
   Backup:         $(if (( BACKUP )); then echo "restic täglich nach $BACKUP_REPO"; else echo nein; fi)
   Laptop:         $(if (( LAPTOP )); then echo "ja, Ruhezustand $(yn "$HIBERNATE"), Deckel: $LID$(if (( CPU_INTEL )); then echo ", thermald"; fi)"; else echo nein; fi)
@@ -1907,17 +1959,34 @@ done < <(lsblk -lnpo NAME "$DISK" | tail -n +2)
 wipefs -af "$DISK" >/dev/null
 udevadm settle
 
-if ! parted -s "$DISK" -- \
-  mklabel gpt \
-  mkpart ESP fat32 1MiB "${ESP_END_MIB}MiB" \
-  set 1 esp on \
-  mkpart nixos btrfs "${ESP_END_MIB}MiB" 100%; then
-  warn "parted meldet einen Fehler, lese die Partitionstabelle erneut ein."
+if [[ $BOOT_MODE == uefi ]]; then
+  parted_ok=1
+  parted -s "$DISK" -- \
+    mklabel gpt \
+    mkpart ESP fat32 "${BOOT_START_MIB}MiB" "${BOOT_END_MIB}MiB" \
+    set 1 esp on \
+    mkpart nixos btrfs "${BOOT_END_MIB}MiB" 100% || parted_ok=0
+else
+  # GPT mit BIOS-Boot-Partition für GRUB; pmbr_boot hilft älteren BIOS, die sonst nicht von GPT starten
+  parted_ok=1
+  parted -s "$DISK" -- \
+    mklabel gpt \
+    mkpart biosboot 1MiB 2MiB \
+    set 1 bios_grub on \
+    mkpart boot ext4 "${BOOT_START_MIB}MiB" "${BOOT_END_MIB}MiB" \
+    mkpart nixos btrfs "${BOOT_END_MIB}MiB" 100% \
+    disk_set pmbr_boot on || parted_ok=0
 fi
+if (( ! parted_ok )); then warn "parted meldet einen Fehler, lese die Partitionstabelle erneut ein."; fi
 reread_partitions "$DISK"
 
-info "Formatiere ESP"
-mkfs.fat -F 32 -n boot "$ESP" >/dev/null
+if [[ $BOOT_MODE == uefi ]]; then
+  info "Formatiere EFI-Partition"
+  mkfs.fat -F 32 -n boot "$BOOTPART" >/dev/null
+else
+  info "Formatiere /boot"
+  mkfs.ext4 -q -F -L boot "$BOOTPART"
+fi
 
 if (( ENCRYPT )); then
   info "Richte LUKS2 ein – Passphrase zweimal eingeben, danach zum Öffnen ein drittes Mal"
@@ -1953,7 +2022,11 @@ if (( SWAP_GB > 0 )); then
   mkdir -p /mnt/swap
   mount -o "subvol=@swap,noatime" "$BTRFS_DEV" /mnt/swap
 fi
-mount -o umask=077 "$ESP" /mnt/boot
+if [[ $BOOT_MODE == uefi ]]; then
+  mount -o umask=077 "$BOOTPART" /mnt/boot
+else
+  mount "$BOOTPART" /mnt/boot
+fi
 if (( SNAPPER )); then
   btrfs subvolume create /mnt/home/.snapshots >/dev/null
   chmod 750 /mnt/home/.snapshots
