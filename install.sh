@@ -54,6 +54,8 @@
 #                  GAMING (nur mit Desktop), darin STEAM RETROARCH und die Emulatoren
 #                  EMU_PS2 EMU_PS3 EMU_PSP EMU_GCWII EMU_WIIU EMU_SWITCH EMU_3DS EMU_NDS
 #                  EMU_GBA EMU_N64 EMU_XBOX EMU_DC
+#                  SOFTWARE (weitere Programme, nur mit Desktop), Kategorien SW_MEDIA SW_OFFICE SW_WEB
+#                  SW_CHAT SW_GRAPHICS SW_DEV SW_TOOLS, Programme APP_* (Liste: SW_APPS weiter unten)
 #                  DISK_FORCE, DISK2_FORCE (trotz SMART-Warnung installieren)
 # Ohne Abfrage, nur per Variable: ESP_GB (Größe von /boot in GiB, 1), COMPRESS (zstd), ZRAM (j),
 #   BOOT_MODE (uefi | bios; Standard: wie der USB-Stick gestartet wurde),
@@ -799,6 +801,85 @@ ANSWER_VARS=(CHANNEL KB LOCALE TIMEZONE DESKTOP DESKTOP_MODE GPU NV_OPEN KERNEL 
 GAME_ITEMS=(STEAM\|Steam RETROARCH\|RetroArch EMU_PS2\|PS2 EMU_PS3\|PS3 EMU_PSP\|PSP EMU_GCWII\|GameCube/Wii
   EMU_WIIU\|"Wii U" EMU_SWITCH\|Switch EMU_3DS\|3DS EMU_NDS\|DS EMU_GBA\|"GB/GBC/GBA" EMU_N64\|N64
   EMU_XBOX\|Xbox EMU_DC\|Dreamcast)
+
+# Weitere Programme (nur mit Desktop): erst Kategorien, dann Programme je Kategorie
+SW_CATS=(
+  "SW_MEDIA|Video und Musik"
+  "SW_OFFICE|Office und Dokumente"
+  "SW_WEB|Internet und Dateien"
+  "SW_CHAT|Kommunikation"
+  "SW_GRAPHICS|Grafik, Foto und 3D"
+  "SW_DEV|Entwicklung"
+  "SW_TOOLS|System und Werkzeuge"
+)
+# Kategorie|Variable|Vorauswahl j/n|Merkmale|Pakete|Text
+# Merkmale: u = unfrei, p = NixOS-Modul programs.<Paket>.enable statt Paket
+SW_APPS=(
+  "SW_MEDIA|APP_VLC|j||vlc|VLC (spielt fast alle Formate ab)"
+  "SW_MEDIA|APP_CODECS|j||ffmpeg-full|Codecs (FFmpeg, GStreamer für H.264/H.265, AAC, MP3 …)"
+  "SW_MEDIA|APP_MPV|n||mpv|mpv (schlanker Videoplayer)"
+  "SW_MEDIA|APP_STRAWBERRY|n||strawberry|Strawberry (Musiksammlung)"
+  "SW_MEDIA|APP_SPOTIFY|n|u|spotify|Spotify"
+  "SW_MEDIA|APP_AUDACITY|n||audacity|Audacity (Audio bearbeiten)"
+  "SW_MEDIA|APP_OBS|n||obs-studio|OBS Studio (Bildschirm aufnehmen, streamen)"
+  "SW_MEDIA|APP_KDENLIVE|n||kdePackages.kdenlive|Kdenlive (Videoschnitt)"
+  "SW_MEDIA|APP_HANDBRAKE|n||handbrake|HandBrake (Videos umwandeln)"
+  "SW_OFFICE|APP_LIBREOFFICE|j||libreoffice hunspellDicts.de_DE hunspellDicts.en_US|LibreOffice (mit Rechtschreibprüfung Deutsch/Englisch)"
+  "SW_OFFICE|APP_ONLYOFFICE|n||onlyoffice-desktopeditors|ONLYOFFICE (gut mit Word-, Excel- und PowerPoint-Dateien)"
+  "SW_OFFICE|APP_OKULAR|n||kdePackages.okular|Okular (PDF ansehen, kommentieren, unterschreiben)"
+  "SW_OFFICE|APP_PDFARRANGER|n||pdfarranger|PDF Arranger (PDF-Seiten zusammenfügen, drehen, löschen)"
+  "SW_OFFICE|APP_XOURNAL|n||xournalpp|Xournal++ (PDF ausfüllen, handschriftliche Notizen)"
+  "SW_OFFICE|APP_OBSIDIAN|n|u|obsidian|Obsidian (Notizen)"
+  "SW_OFFICE|APP_JOPLIN|n||joplin-desktop|Joplin (Notizen mit Synchronisation)"
+  "SW_WEB|APP_CHROMIUM|n||chromium|Chromium"
+  "SW_WEB|APP_CHROME|n|u|google-chrome|Google Chrome"
+  "SW_WEB|APP_BRAVE|n||brave|Brave"
+  "SW_WEB|APP_TOR|n||tor-browser|Tor Browser"
+  "SW_WEB|APP_NEXTCLOUD|n||nextcloud-client|Nextcloud (Dateien synchronisieren)"
+  "SW_WEB|APP_QBITTORRENT|n||qbittorrent|qBittorrent"
+  "SW_WEB|APP_FILEZILLA|n||filezilla|FileZilla (FTP, SFTP)"
+  "SW_WEB|APP_LOCALSEND|n|p|localsend|LocalSend (Dateien ans Handy schicken, öffnet Port 53317)"
+  "SW_CHAT|APP_THUNDERBIRD|j||thunderbird|Thunderbird (E-Mail, Kalender, Kontakte)"
+  "SW_CHAT|APP_SIGNAL|n||signal-desktop|Signal"
+  "SW_CHAT|APP_TELEGRAM|n||telegram-desktop|Telegram"
+  "SW_CHAT|APP_ELEMENT|n||element-desktop|Element (Matrix)"
+  "SW_CHAT|APP_DISCORD|n|u|discord|Discord"
+  "SW_CHAT|APP_VESKTOP|n||vesktop|Vesktop (freier Discord-Client, Bildschirmfreigabe unter Wayland)"
+  "SW_CHAT|APP_ZOOM|n|u|zoom-us|Zoom"
+  "SW_CHAT|APP_TEAMS|n||teams-for-linux|Teams (inoffizieller Client)"
+  "SW_CHAT|APP_SLACK|n|u|slack|Slack"
+  "SW_GRAPHICS|APP_GIMP|j||gimp|GIMP (Bildbearbeitung)"
+  "SW_GRAPHICS|APP_INKSCAPE|n||inkscape|Inkscape (Vektorgrafik)"
+  "SW_GRAPHICS|APP_KRITA|n||krita|Krita (digitales Malen)"
+  "SW_GRAPHICS|APP_DARKTABLE|n||darktable|darktable (RAW-Fotos entwickeln)"
+  "SW_GRAPHICS|APP_BLENDER|n||blender|Blender (3D)"
+  "SW_GRAPHICS|APP_FREECAD|n||freecad|FreeCAD (CAD)"
+  "SW_DEV|APP_VSCODE|j|u|vscode-fhs|Visual Studio Code (Erweiterungen mit eigenen Programmen laufen)"
+  "SW_DEV|APP_VSCODIUM|n||vscodium|VSCodium (VS Code ohne Microsoft-Telemetrie)"
+  "SW_DEV|APP_ZED|n||zed-editor|Zed (Editor)"
+  "SW_DEV|APP_NEOVIM|n||neovim|Neovim"
+  "SW_DEV|APP_BUILD|n||gcc gnumake cmake pkg-config gdb|C/C++ (gcc, make, cmake, gdb)"
+  "SW_DEV|APP_PYTHON|n||python3 uv|Python 3 mit uv"
+  "SW_DEV|APP_NODE|n||nodejs|Node.js mit npm"
+  "SW_DEV|APP_RUST|n||rustup|Rust (rustup)"
+  "SW_DEV|APP_GO|n||go|Go"
+  "SW_DEV|APP_GITTOOLS|j||gh lazygit|gh und lazygit (GitHub-CLI, Git im Terminal)"
+  "SW_DEV|APP_DBEAVER|n||dbeaver-bin|DBeaver (Datenbanken)"
+  "SW_DEV|APP_BRUNO|n||bruno|Bruno (APIs testen)"
+  "SW_TOOLS|APP_KEEPASSXC|j||keepassxc|KeePassXC (Passwörter)"
+  "SW_TOOLS|APP_BITWARDEN|n||bitwarden-desktop|Bitwarden"
+  "SW_TOOLS|APP_REMMINA|n||remmina|Remmina (Fernzugriff per RDP, VNC)"
+  "SW_TOOLS|APP_RUSTDESK|n||rustdesk-flutter|RustDesk (Fernwartung)"
+  "SW_TOOLS|APP_WIRESHARK|n|p|wireshark|Wireshark (Netzwerkverkehr mitschneiden)"
+  "SW_TOOLS|APP_GPARTED|n||gparted|GParted (Partitionen)"
+  "SW_TOOLS|APP_IMPRESSION|n||impression|Impression (ISO auf USB-Stick schreiben)"
+  "SW_TOOLS|APP_MISSIONCENTER|n||mission-center|Mission Center (Systemmonitor)"
+  "SW_TOOLS|APP_WINE|n||wineWow64Packages.stable winetricks|Wine mit winetricks (Windows-Programme)"
+  "SW_TOOLS|APP_BOTTLES|n|u|bottles|Bottles (Windows-Programme in eigenen Umgebungen)"
+)
+ANSWER_VARS+=(SOFTWARE)
+for e in "${SW_CATS[@]}"; do ANSWER_VARS+=("${e%%|*}"); done
+for e in "${SW_APPS[@]}"; do IFS='|' read -r _ v _ <<<"$e"; ANSWER_VARS+=("$v"); done
 # Nicht gespeichert, weil rechnerspezifisch: DISK, DISK2, HW_PROFILE, INSTALL_MODE, DISK2_MODE
 # Geheime Werte, nur aus der Passwortdatei (PASSWORT_DATEI), werden nie gespeichert
 SECRET_VARS=(LUKS_PASS ROOT_PASS ROOT_HASH USER_PASS USER_HASH EXTRA_PASS EXTRA_HASH SAMBA_PASS
@@ -952,8 +1033,7 @@ fi
 SILENT_NIX=""
 if (( SILENT )); then
   SILENT_NIX='  boot.plymouth.enable = true;   # Startbildschirm, fragt auch das LUKS-Passwort ab
-  boot.consoleLogLevel = 3;      # nur Fehler auf der Konsole
-  boot.initrd.verbose = false;   # Kernel-Parameter dafür stehen oben bei "Kernel"'
+  boot.consoleLogLevel = 3;      # nur Fehler auf der Konsole (weitere Kernel-Parameter oben bei "Kernel")'
 fi
 
 LUKS_NIX=""
@@ -1246,6 +1326,7 @@ if [[ $GPU != none ]]; then
   hardware.amdgpu.initrd.enable = true;  # Grafik früh laden, sauberer Startbildschirm'
   fi
   # Mit Hardware-Profil gelten dessen NVIDIA-Werte; unsere greifen nur, wo es nichts vorgibt
+  # (offload.enable mit 995: über dem mkDefault false des NVIDIA-Moduls, unter nixos-hardware mit 990)
   if [[ $HW_PROFILE != none ]]; then W='lib.mkOverride 1100 '; else W=''; fi
   if [[ $GPU == nvidia || $GPU == nvidia-prime ]]; then
     if (( NV_OPEN )); then nvopen=true; else nvopen=false; fi
@@ -1268,7 +1349,7 @@ if [[ $GPU != none ]]; then
     if [[ $IGPU_VENDOR == intel ]]; then igpu_opt=intelBusId; else igpu_opt=amdgpuBusId; fi
     GPU_NIX+="
   hardware.nvidia.prime = {
-    offload.enable = ${W}true;
+    offload.enable = ${W:+lib.mkOverride 995 }true;
     offload.enableOffloadCmd = ${W}true;  # Programme mit \"nvidia-offload <programm>\" auf der NVIDIA-GPU starten
     $igpu_opt = $W\"$(pci_busid "$IGPU_DEV")\";
     nvidiaBusId = $W\"$(pci_busid "$NV_DEV")\";
@@ -1344,6 +1425,41 @@ if (( GAMING )); then
   if (( EMU_N64 ));    then GAMING_PKGS+=$'\n    rmg                 # Nintendo 64 (Rosalie\'s Mupen GUI)'; fi
   if (( EMU_XBOX ));   then GAMING_PKGS+=$'\n    xemu                # Xbox (Classic)'; fi
   if (( EMU_DC ));     then GAMING_PKGS+=$'\n    flycast             # Dreamcast'; fi
+fi
+
+# Weitere Programme
+SW_PKGS=""; SW_NIX=""
+for ce in "${SW_CATS[@]}"; do
+  c=${ce%%|*}; block=""
+  for e in "${SW_APPS[@]}"; do
+    IFS='|' read -r ac v _ flags pkgs text <<<"$e"
+    if [[ $ac != "$c" || ${!v-0} != 1 ]]; then continue; fi
+    if [[ $flags == *p* ]]; then
+      SW_NIX+="${SW_NIX:+$'\n'}  programs.$pkgs.enable = true;  # ${text}"
+      continue
+    fi
+    first=1
+    for pk in $pkgs; do
+      if (( first )); then block+=$'\n'"$(printf '    %-28s# %s' "$pk" "$text")"; first=0
+      else block+=$'\n'"    $pk"; fi
+    done
+  done
+  if [[ -n $block ]]; then SW_PKGS+=$'\n'"    # ${ce#*|}$block"; fi
+done
+if (( APP_WIRESHARK )); then
+  SW_NIX+=$'\n  programs.wireshark.package = pkgs.wireshark;  # mit Oberfläche; mitschneiden dürfen Mitglieder von "wireshark"'
+fi
+if (( APP_CODECS )); then
+  SW_NIX+="${SW_NIX:+$'\n'}"'  # GStreamer-Codecs für alle Programme (Videos, Musik, Browser-Vorschau)
+  environment.sessionVariables.GST_PLUGIN_SYSTEM_PATH_1_0 = lib.makeSearchPathOutput "lib" "lib/gstreamer-1.0" (
+    with pkgs.gst_all_1; [
+      gst-plugins-base
+      gst-plugins-good
+      gst-plugins-bad
+      gst-plugins-ugly  # MP3, DVD u. a.
+      gst-libav         # alles, was FFmpeg kann (H.264, H.265, AAC …)
+    ]
+  );'
 fi
 
 # Avahi: Drucker, NAS und Rechner im Netz finden, Namen wie nas.local auflösen
@@ -1538,6 +1654,7 @@ fi
 if [[ $NET_MODE == static ]]; then NMGRP=''; else NMGRP=' "networkmanager"'; fi
 ADMIN_GROUPS='"wheel"'"$NMGRP"' "audio"'
 if (( LIBVIRT )); then ADMIN_GROUPS+=' "libvirtd"'; fi
+if (( APP_WIRESHARK )); then ADMIN_GROUPS+=' "wireshark"'; fi
 if [[ $CONTAINERS == docker ]]; then ADMIN_GROUPS+=' "docker"'; fi
 USER_UID=""
 if [[ $DISK2_MODE == keep && $DATA_FSTYPE =~ ^(ntfs3|exfat|vfat)$ ]]; then
@@ -1728,6 +1845,12 @@ fi
 
 NIXSET_NIX='  nix.settings.auto-optimise-store = true;  # identische Dateien im Store per Hardlink zusammenlegen'
 
+# unrar ist unfrei; ohne Unfree die freie Variante unrar-free (auf Basis von libarchive)
+if (( UNFREE )); then
+  UNRAR_PKG='    unrar               # RAR-Archive entpacken'
+else
+  UNRAR_PKG='    unrar-free          # RAR-Archive entpacken (freie Variante)'
+fi
 PKG_NIX='  environment.systemPackages = with pkgs; [
     # Grundausstattung
     git
@@ -1755,6 +1878,7 @@ PKG_NIX='  environment.systemPackages = with pkgs; [
     # Dateien und Archive
     unzip
     p7zip
+'"$UNRAR_PKG"'
     rsync
     ncdu                # Platzfresser finden
     lsof                # wer hält eine Datei offen?
@@ -1762,6 +1886,7 @@ PKG_NIX='  environment.systemPackages = with pkgs; [
     nvme-cli
     lshw
     inxi                # Hardware-Übersicht
+    hyfetch             # Systeminfo mit Logo (neofetch-Nachfolger)
     # Netzwerk (mtr über programs.mtr)
     dnsutils            # dig, nslookup
     nmap
@@ -1822,6 +1947,7 @@ if (( UKI )); then
 fi
 PKG_NIX+="$DESKTOP_PKGS"
 PKG_NIX+="$GAMING_PKGS"
+PKG_NIX+="$SW_PKGS"
 PKG_NIX+='
   ];'
 
@@ -1846,6 +1972,7 @@ PKG_NIX+='
   emit "Grafik"                              "$GPU_NIX"
   emit "Drucken und Bluetooth"              "$EXTRAS_NIX"
   emit "Spiele und Emulatoren"              "$GAMING_NIX"
+  emit "Weitere Programme"                  "$SW_NIX"
   emit "Netzwerkdienste finden (mDNS)"       "$AVAHI_NIX"
   emit "VPN und Schutz"                      "$VPN_NIX"
   emit "Samba-Freigabe"                      "$SAMBA_NIX"
@@ -2296,17 +2423,14 @@ else
   GAMING=0
 fi
 if (( GAMING )); then
-  game_opts=()
-  # Steam, PCSX2 und Cemu gibt es nur für x86_64
-  if [[ $(uname -m) == x86_64 ]]; then game_opts+=(STEAM "Steam (mit Proton für Windows-Spiele)" j); fi
-  game_opts+=(RETROARCH "RetroArch (NES, SNES, N64, Mega Drive, PS1, Game Boy)" n)
-  if [[ $(uname -m) == x86_64 ]]; then game_opts+=(EMU_PS2 "PlayStation 2 (PCSX2)" n); fi
-  game_opts+=(
+  game_opts=(
+    STEAM      "Steam (mit Proton für Windows-Spiele)" j
+    RETROARCH  "RetroArch (NES, SNES, N64, Mega Drive, PS1, Game Boy)" n
+    EMU_PS2    "PlayStation 2 (PCSX2)" n
     EMU_PS3    "PlayStation 3 (RPCS3, wird beim Installieren kompiliert, dauert lange)" n
     EMU_PSP    "PSP (PPSSPP)" n
-    EMU_GCWII  "GameCube / Wii (Dolphin)" n)
-  if [[ $(uname -m) == x86_64 ]]; then game_opts+=(EMU_WIIU "Wii U (Cemu)" n); fi
-  game_opts+=(
+    EMU_GCWII  "GameCube / Wii (Dolphin)" n
+    EMU_WIIU   "Wii U (Cemu)" n
     EMU_SWITCH "Switch (Ryubing und Eden)" n
     EMU_3DS    "3DS (Azahar)" n
     EMU_NDS    "Nintendo DS (melonDS)" n
@@ -2325,6 +2449,55 @@ for it in "${GAME_ITEMS[@]}"; do
   else
     printf -v "$v" 0
   fi
+done
+
+# ---------- Weitere Programme ----------
+# Per Variable oder Antwortdatei gewählte Programme schalten ihre Kategorie mit ein
+for e in "${SW_APPS[@]}"; do
+  IFS='|' read -r c v _ <<<"$e"
+  if is_yes "${!v-}"; then
+    if [[ -z ${SOFTWARE-} ]]; then SOFTWARE=j; fi
+    if [[ -z ${!c-} ]]; then printf -v "$c" j; fi
+  fi
+done
+if [[ $DESKTOP != none ]]; then
+  ask_yn SOFTWARE "Weitere Programme nach Kategorien auswählen (Video, Office, Entwicklung …)?" n
+else
+  SOFTWARE=0
+fi
+if (( SOFTWARE )); then
+  sw_opts=()
+  for e in "${SW_CATS[@]}"; do sw_opts+=("${e%%|*}" "${e#*|}" n); done
+  ask_multi "Weitere Programme: Kategorien" "${sw_opts[@]}"
+  for ce in "${SW_CATS[@]}"; do
+    c=${ce%%|*}
+    if [[ ${!c} != 1 ]]; then continue; fi
+    sw_opts=()
+    for e in "${SW_APPS[@]}"; do
+      IFS='|' read -r ac v def flags _ text <<<"$e"
+      if [[ $ac != "$c" ]]; then continue; fi
+      if [[ $flags == *u* ]]; then text+=" [unfrei]"; fi
+      sw_opts+=("$v" "$text" "$def")
+    done
+    ask_multi "${ce#*|}" "${sw_opts[@]}"
+  done
+fi
+# Nur Programme in gewählten Kategorien zählen; alles andere aus
+SW_SUMMARY=""; SW_UNFREE=()
+for ce in "${SW_CATS[@]}"; do
+  c=${ce%%|*}; names=""
+  if (( ! SOFTWARE )) || [[ ${!c-} != 1 ]]; then printf -v "$c" 0; fi
+  for e in "${SW_APPS[@]}"; do
+    IFS='|' read -r ac v _ flags _ text <<<"$e"
+    if [[ $ac != "$c" ]]; then continue; fi
+    if [[ ${!c} == 1 && ${!v-} == 1 ]]; then
+      names+="${names:+, }${text%% (*}"
+      if [[ $flags == *u* ]]; then SW_UNFREE+=("${text%% (*}"); fi
+    else
+      printf -v "$v" 0
+    fi
+  done
+  if [[ -n $names ]]; then SW_SUMMARY+=$'\n'"    ${ce#*|}: $names"; fi
 done
 
 # ---------- Samba ----------
@@ -2397,8 +2570,14 @@ else
     SNAPPER "Automatische Snapshots für /home (snapper, stündlich, wird ausgedünnt)" j \
     RESCUE  "$(if [[ $BOOT_MODE == uefi ]]; then echo "Rettungseinträge im Bootmenü (Memtest86+, netboot.xyz)"; else echo "Memtest86+ im Bootmenü (Arbeitsspeicher testen)"; fi)" j
 fi
-if (( ! UNFREE )) && { [[ $GPU == nvidia || $GPU == nvidia-prime ]] || (( STEAM || RETROARCH || EMU_PS3 )); }; then
-  note "NVIDIA-Treiber, Steam, RPCS3 und der Mega-Drive-Kern von RetroArch brauchen unfreie Pakete, Unfree wird aktiviert."
+UNFREE_WHY=()
+if [[ $GPU == nvidia || $GPU == nvidia-prime ]]; then UNFREE_WHY+=("NVIDIA-Treiber"); fi
+if (( STEAM )); then UNFREE_WHY+=(Steam); fi
+if (( EMU_PS3 )); then UNFREE_WHY+=(RPCS3); fi
+if (( RETROARCH )); then UNFREE_WHY+=("RetroArch (Mega-Drive-Kern)"); fi
+UNFREE_WHY+=("${SW_UNFREE[@]}")
+if (( ! UNFREE && ${#UNFREE_WHY[@]} > 0 )); then
+  note "Unfreie Pakete gewählt ($(printf '%s, ' "${UNFREE_WHY[@]}" | sed 's/, $//')), Unfree wird aktiviert."
   UNFREE=1
 fi
 
@@ -2709,6 +2888,7 @@ $(case $DISK2_MODE in
   Fingerabdruck:  $(yn "$FINGERPRINT")
   Extras:         Drucken $(yn "$PRINTING"), Bluetooth $(yn "$BLUETOOTH")
   Gaming:         $(if (( GAMING )); then echo "${GAME_SUMMARY:-nur Gamemode und Controller}"; else echo nein; fi)
+  Programme:      $(if [[ -n $SW_SUMMARY ]]; then echo "zusätzlich:$SW_SUMMARY"; else echo "keine zusätzlichen"; fi)
   Samba:          $(case $SAMBA in none) echo nein ;; client) echo "Client (Netzlaufwerke nutzen)" ;; server) echo "Client + Freigabe ~/Freigabe" ;; esac)
   VMs/Container:  libvirt $(yn "$LIBVIRT"), Container: $CONTAINERS
   Schriften:      $(if [[ $DESKTOP != none ]]; then echo "Noto inkl. Emoji/CJK, JetBrains Mono Nerd Font"; else echo "Standard"; fi)

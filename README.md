@@ -133,10 +133,12 @@ Vorher im anderen System Platz freigeben (Windows: Datenträgerverwaltung → Vo
 - PipeWire mit ALSA (inkl. 32 bit), PulseAudio und JACK
 - Optional: Drucken, Bluetooth, Samba (Client oder Server), Flatpak + Flathub, SSH nur mit Schlüssel
 - Gaming (nur mit Desktop, siehe unten): Steam, RetroArch und Emulatoren zum Ankreuzen, dazu Gamemode und Controller-Regeln
+- Weitere Programme nach Kategorien (nur mit Desktop, siehe unten)
 - Schriften: Noto mit Emoji und CJK, JetBrains Mono Nerd Font
 - zsh mit fertiger `~/.zshrc`, optional oh-my-zsh; weitere Benutzer ohne Admin-Rechte
 - Optional [home-manager](https://github.com/nix-community/home-manager): Shell, Aliase und Git-Identität in `/etc/nixos/home.nix`
-- Systempakete: git, nixfmt, vim, btop, ripgrep, fd, bat, jq, tmux, ncdu, nvme-cli, inxi, dig, nmap, tcpdump, iperf3, nix-tree, nh, direnv u. a.
+- Systempakete: git, nixfmt, vim, btop, ripgrep, fd, bat, jq, tmux, ncdu, nvme-cli, inxi, hyfetch, unrar, dig, nmap, tcpdump, iperf3, nix-tree, nh, direnv u. a.
+  (`unrar` ist unfrei, ohne Unfree kommt `unrar-free`)
 
 ## Gaming
 
@@ -161,12 +163,32 @@ Mit Desktop fragt das Skript, ob Gaming eingerichtet werden soll. Dann gibt es e
 
 Immer dabei: Gamemode (`gamemoderun <programm>`) und udev-Regeln, damit Controller ohne root funktionieren
 (Steam-Hardware, DualShock/DualSense, Switch Pro, Joy-Cons, 8BitDo; bei Dolphin auch der GameCube-Adapter).
-Steam, PCSX2 und Cemu gibt es nur auf x86_64. Steam, RPCS3 und der Mega-Drive-Kern von RetroArch schalten Unfree ein.
+Steam, RPCS3 und der Mega-Drive-Kern von RetroArch schalten Unfree ein.
 RPCS3 liegt wegen der Lizenz nicht im Binär-Cache und wird bei der Installation kompiliert (dauert deutlich länger).
 Ohne Abfrage: `GAMING=j STEAM=j EMU_PS2=j EMU_SWITCH=j …`. Ältere Antwortdateien mit `STEAM=j` funktionieren weiter.
 
 BIOS, Firmware und Schlüssel (PS2-BIOS, PS3-Firmware, Switch `prod.keys` und Firmware, Xbox-BIOS und MCPX-ROM)
 liefert kein Paket mit, sie kommen aus den eigenen Konsolen.
+
+## Weitere Programme
+
+Mit Desktop fragt das Skript, ob weitere Programme dazukommen sollen. Erst werden Kategorien angekreuzt,
+dann die Programme darin (vorausgewählt ist jeweils das Übliche, **fett** unten):
+
+| Kategorie (Variable) | Programme |
+|---|---|
+| Video und Musik (`SW_MEDIA`) | **VLC**, **Codecs** (FFmpeg, GStreamer good/bad/ugly/libav), mpv, Strawberry, Spotify, Audacity, OBS Studio, Kdenlive, HandBrake |
+| Office und Dokumente (`SW_OFFICE`) | **LibreOffice** (mit Rechtschreibprüfung de/en), ONLYOFFICE, Okular, PDF Arranger, Xournal++, Obsidian, Joplin |
+| Internet und Dateien (`SW_WEB`) | Chromium, Google Chrome, Brave, Tor Browser, Nextcloud, qBittorrent, FileZilla, LocalSend |
+| Kommunikation (`SW_CHAT`) | **Thunderbird**, Signal, Telegram, Element, Discord, Vesktop, Zoom, Teams (inoffiziell), Slack |
+| Grafik, Foto und 3D (`SW_GRAPHICS`) | **GIMP**, Inkscape, Krita, darktable, Blender, FreeCAD |
+| Entwicklung (`SW_DEV`) | **VS Code**, VSCodium, Zed, Neovim, C/C++-Werkzeuge, Python mit uv, Node.js, Rust, Go, **gh und lazygit**, DBeaver, Bruno |
+| System und Werkzeuge (`SW_TOOLS`) | **KeePassXC**, Bitwarden, Remmina, RustDesk, Wireshark, GParted, Impression, Mission Center, Wine mit winetricks, Bottles |
+
+Ohne Abfrage: `SOFTWARE=j APP_VLC=j APP_VSCODE=j …`, die Kategorie schaltet sich dabei selbst ein. Alle Variablen
+stehen in der Liste `SW_APPS` im Skript. Unfreie Programme (VS Code, Chrome, Spotify, Discord, Zoom, Slack, Obsidian)
+schalten Unfree ein, ebenso Bottles (unter unstable mit unfreier Abhängigkeit).
+Wireshark: Der Hauptbenutzer kommt in die Gruppe `wireshark` und darf ohne root mitschneiden.
 
 ## Secure Boot (nur mit UKI)
 
