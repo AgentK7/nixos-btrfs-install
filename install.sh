@@ -814,7 +814,7 @@ SW_CATS=(
   "SW_TOOLS|System und Werkzeuge"
 )
 # Kategorie|Variable|Vorauswahl j/n|Merkmale|Pakete|Text
-# Merkmale: u = unfrei, p = NixOS-Modul programs.<Paket>.enable statt Paket, f = Flatpak (Sonderfall unten)
+# Merkmale: u = unfrei, p = NixOS-Modul programs.<Paket>.enable statt Paket; Paket "-" = Sonderfall weiter unten
 SW_APPS=(
   "SW_MEDIA|APP_VLC|j||vlc|VLC (spielt fast alle Formate ab)"
   "SW_MEDIA|APP_CODECS|j||ffmpeg-full|Codecs (FFmpeg, GStreamer für H.264/H.265, AAC, MP3 …)"
@@ -839,6 +839,7 @@ SW_APPS=(
   "SW_WEB|APP_NEXTCLOUD|n||nextcloud-client|Nextcloud (Dateien synchronisieren)"
   "SW_WEB|APP_QBITTORRENT|n||qbittorrent|qBittorrent"
   "SW_WEB|APP_FILEZILLA|n||filezilla|FileZilla (FTP, SFTP)"
+  "SW_WEB|APP_TAILSCALE|n||-|Tailscale (VPN ins eigene Netz, mit Oberfläche)"
   "SW_WEB|APP_LOCALSEND|n|p|localsend|LocalSend (Dateien ans Handy schicken, öffnet Port 53317)"
   "SW_CHAT|APP_THUNDERBIRD|j||thunderbird|Thunderbird (E-Mail, Kalender, Kontakte)"
   "SW_CHAT|APP_SIGNAL|n||signal-desktop|Signal"
@@ -857,7 +858,7 @@ SW_APPS=(
   "SW_GRAPHICS|APP_FREECAD|n||freecad|FreeCAD (CAD)"
   "SW_PRINT|APP_PRUSASLICER|j||prusa-slicer|PrusaSlicer"
   "SW_PRINT|APP_ORCASLICER|j||orca-slicer|OrcaSlicer (Profile für Bambu, Creality, Anycubic, Voron …)"
-  "SW_PRINT|APP_ANYCUBIC|n|f|-|Anycubic Slicer Next (inoffizielles Flatpak, kommt beim ersten Start mit Internet)"
+  "SW_PRINT|APP_ANYCUBIC|n||-|Anycubic Slicer Next (inoffizielles Flatpak, kommt beim ersten Start mit Internet)"
   "SW_PRINT|APP_CURA|n||cura-appimage|UltiMaker Cura"
   "SW_PRINT|APP_BAMBU|n|u|bambu-studio|Bambu Studio (wird beim Installieren kompiliert, dauert lange)"
   "SW_PRINT|APP_OPENSCAD|n||openscad-unstable|OpenSCAD (Modelle per Code, aktuelle Entwicklerversion)"
@@ -1246,25 +1247,28 @@ if (( TPM2 )); then
 fi
 
 VPN_NIX=""
-case $VPN in
-  tailscale)
-    VPN_NIX='  services.tailscale = {
+if (( TAILSCALE )); then
+  VPN_NIX='  services.tailscale = {
     enable = true;
     openFirewall = true;  # direkte Verbindungen statt Umweg über Relais'
-    if [[ -n ${TS_AUTHKEY-} ]]; then
-      VPN_NIX+='
-    authKeyFile = "/var/lib/tailscale/authkey";  # meldet sich beim ersten Start an'
-    fi
+  if [[ -n ${TS_AUTHKEY-} ]]; then
     VPN_NIX+='
-  };' ;;
-  wireguard)
-    VPN_NIX='  networking.wg-quick.interfaces.wg0.configFile = "/etc/wireguard/wg0.conf";  # vom Installer kopiert'
-    wg_port=$(sed -n 's/^ListenPort[[:space:]]*=[[:space:]]*\([0-9]\+\).*/\1/p' <<<"$WG_CONF_TEXT" | head -n1)
-    if [[ -n $wg_port ]]; then
-      VPN_NIX+=$'\n  networking.firewall.allowedUDPPorts = [ '"$wg_port"' ];  # ListenPort aus wg0.conf'
-    fi
-    ;;
-esac
+    authKeyFile = "/var/lib/tailscale/authkey";  # meldet sich beim ersten Start an'
+  fi
+  if [[ $DESKTOP != none ]]; then
+    VPN_NIX+="
+    extraSetFlags = [ \"--operator=$NIX_USER\" ];  # Oberfläche darf Tailscale ohne sudo steuern"
+  fi
+  VPN_NIX+='
+  };'
+fi
+if [[ $VPN == wireguard ]]; then
+  VPN_NIX+="${VPN_NIX:+$'\n'}"'  networking.wg-quick.interfaces.wg0.configFile = "/etc/wireguard/wg0.conf";  # vom Installer kopiert'
+  wg_port=$(sed -n 's/^ListenPort[[:space:]]*=[[:space:]]*\([0-9]\+\).*/\1/p' <<<"$WG_CONF_TEXT" | head -n1)
+  if [[ -n $wg_port ]]; then
+    VPN_NIX+=$'\n  networking.firewall.allowedUDPPorts = [ '"$wg_port"' ];  # ListenPort aus wg0.conf'
+  fi
+fi
 if (( FAIL2BAN )); then
   if [[ -n $VPN_NIX ]]; then VPN_NIX+=$'\n'; fi
   VPN_NIX+='  services.fail2ban.enable = true;  # sperrt IPs nach wiederholten SSH-Fehlversuchen'
@@ -1443,7 +1447,7 @@ for ce in "${SW_CATS[@]}"; do
   for e in "${SW_APPS[@]}"; do
     IFS='|' read -r ac v _ flags pkgs text <<<"$e"
     if [[ $ac != "$c" || ${!v-0} != 1 ]]; then continue; fi
-    if [[ $flags == *f* ]]; then continue; fi   # Flatpak, siehe FLATPAK_NIX
+    if [[ $pkgs == - ]]; then continue; fi   # Sonderfall: Anycubic in FLATPAK_NIX, Tailscale in VPN_NIX
     if [[ $flags == *p* ]]; then
       SW_NIX+="${SW_NIX:+$'\n'}  programs.$pkgs.enable = true;  # ${text}"
       continue
@@ -1456,6 +1460,10 @@ for ce in "${SW_CATS[@]}"; do
   done
   if [[ -n $block ]]; then SW_PKGS+=$'\n'"    # ${ce#*|}$block"; fi
 done
+if (( TAILSCALE )) && [[ $DESKTOP != none ]]; then
+  if [[ $DESKTOP == plasma ]]; then ts_gui=ktailctl; else ts_gui=trayscale; fi
+  SW_PKGS+=$'\n'"$(printf '    %-28s# %s' "$ts_gui" "Oberfläche für Tailscale (Anmelden, Exit-Node, Taildrop)")"
+fi
 if (( APP_WIRESHARK )); then
   SW_NIX+=$'\n  programs.wireshark.package = pkgs.wireshark;  # mit Oberfläche; mitschneiden dürfen Mitglieder von "wireshark"'
 fi
@@ -2715,15 +2723,18 @@ else
 fi
 
 # ---------- VPN ----------
+if (( APP_TAILSCALE )) && [[ -z ${VPN-} ]]; then VPN=tailscale; fi   # bei den Programmen gewählt
 choose VPN "VPN?" 1 \
   "none|Keins" \
   "tailscale|Tailscale" \
   "wireguard|WireGuard (vorhandene wg0.conf übernehmen)"
 case $VPN in none|tailscale|wireguard) ;; *) die "VPN muss none, tailscale oder wireguard sein." ;; esac
 WG_CONF_TEXT=""
-if [[ $VPN == tailscale ]]; then
+if [[ $VPN == tailscale ]] || (( APP_TAILSCALE )); then TAILSCALE=1; else TAILSCALE=0; fi
+if (( TAILSCALE )); then
   ask_secret TS_AUTHKEY "Tailscale-Auth-Key (leer = nach dem Start: sudo tailscale up)"
-elif [[ $VPN == wireguard ]]; then
+fi
+if [[ $VPN == wireguard ]]; then
   ask WG_CONF "Pfad oder https-URL zur WireGuard-Konfiguration (wg0.conf)" "" '^.+$' "Bitte einen Pfad oder eine URL angeben"
   if [[ $WG_CONF == https://* ]]; then
     WG_CONF_TEXT=$(curl -fsSL --max-time 30 "$WG_CONF") || die "WireGuard-Konfiguration nicht abrufbar: $WG_CONF"
@@ -2884,6 +2895,14 @@ echo "  Konfiguration ist gültig."
 LUKS2_UUID=""   # Platzhalter; der echte Wert kommt beim Einrichten der zweiten Platte
 
 # ---------- Zusammenfassung ----------
+VPN_SUMMARY=""
+if (( TAILSCALE )); then
+  VPN_SUMMARY="Tailscale"
+  if [[ -n ${TS_AUTHKEY-} ]]; then VPN_SUMMARY+=" (meldet sich automatisch an)"; fi
+  if [[ $DESKTOP == plasma ]]; then VPN_SUMMARY+=", Oberfläche KTailctl"
+  elif [[ $DESKTOP != none ]]; then VPN_SUMMARY+=", Oberfläche Trayscale"; fi
+fi
+if [[ $VPN == wireguard ]]; then VPN_SUMMARY+="${VPN_SUMMARY:+, }WireGuard wg0 aus $WG_CONF"; fi
 SUMMARY=$(cat <<EOF
   Datenträger:    $DISK$(if [[ $INSTALL_MODE == dualboot ]]; then echo " (Dual-Boot, vorhandene Partitionen bleiben)"; fi)
 $(if [[ $INSTALL_MODE == dualboot ]]; then
@@ -2939,7 +2958,7 @@ $(case $DISK2_MODE in
   Swap:           ${SWAP_GB} GiB Swapfile$(if (( ZRAM )); then echo " + zram"; fi)
   SSH:            $(yn "$SSHD")$(if (( SSHD )); then if [[ -n $SSH_KEYS_NIX ]]; then echo " ($(grep -c . <<<"$SSH_KEYS_NIX") Schlüssel)"; else echo " (noch ohne Schlüssel)"; fi; fi)$(if (( FAIL2BAN )); then echo ", fail2ban"; fi)
   Netzwerk:       $(if [[ $NET_MODE == static ]]; then echo "fest: $NET_IF $NET_ADDR, Gateway $NET_GW, DNS $NET_DNS${NET_ADDR6:+, $NET_ADDR6}"; else echo "automatisch (NetworkManager)$(if (( WIFI_COPY )); then echo ", WLAN wird übernommen"; fi)"; fi)${LIVE_PROXY:+, Proxy $LIVE_PROXY}
-  VPN:            $(case $VPN in none) echo nein ;; tailscale) echo "Tailscale$(if [[ -n ${TS_AUTHKEY-} ]]; then echo " (meldet sich automatisch an)"; fi)" ;; wireguard) echo "WireGuard wg0 aus $WG_CONF" ;; esac)
+  VPN:            ${VPN_SUMMARY:-nein}
 EOF
 )
 info "Zusammenfassung"
@@ -3359,7 +3378,7 @@ if (( WIFI_COPY )); then
   done
 fi
 
-if [[ $VPN == tailscale && -n ${TS_AUTHKEY-} ]]; then
+if (( TAILSCALE )) && [[ -n ${TS_AUTHKEY-} ]]; then
   install -d -m 700 /mnt/var/lib/tailscale
   ( umask 077; printf '%s' "$TS_AUTHKEY" > /mnt/var/lib/tailscale/authkey )
 fi
@@ -3527,7 +3546,7 @@ if (( SSH_UNLOCK )); then
   echo "  Entsperren beim Start: ssh -p 2222 root@$(if [[ $NET_MODE == static ]]; then echo "${NET_ADDR%/*}"; else echo "$NIX_HOSTNAME"; fi), dann das LUKS-Passwort eingeben"
   echo "    Fingerabdruck des Start-Schlüssels: ${UNLOCK_FP:-?}"
 fi
-if [[ $VPN == tailscale && -z ${TS_AUTHKEY-} ]]; then
+if (( TAILSCALE )) && [[ -z ${TS_AUTHKEY-} ]]; then
   echo "  Tailscale anmelden: sudo tailscale up"
 fi
 if [[ $VPN == wireguard ]]; then

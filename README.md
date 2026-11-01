@@ -94,6 +94,8 @@ erst die WLAN-Auswahl. Werkzeuge wie `dialog`, `smartctl` und `sbctl` sind schon
 - **WLAN übernehmen:** Ist im Live-System ein WLAN verbunden, kopiert das Skript die Verbindung ins neue System – es ist nach dem ersten Start sofort online.
 - **Server (ohne Desktop):** DHCP oder feste IP (IPv4, optional IPv6) über systemd-networkd; Vorschläge kommen aus der aktuellen Verbindung.
 - **VPN:** Tailscale (mit Auth-Key meldet es sich beim ersten Start selbst an) oder WireGuard (vorhandene `wg0.conf` als Pfad oder https-URL, `ListenPort` wird in der Firewall geöffnet).
+  Tailscale lässt sich auch bei den weiteren Programmen ankreuzen (`APP_TAILSCALE`). Mit Desktop kommt eine Oberfläche dazu
+  (KTailctl unter Plasma, sonst Trayscale), und der Hauptbenutzer darf Tailscale ohne sudo steuern (`--operator`).
 - **fail2ban** für SSH, wenn SSH eingerichtet wird.
 - **Entsperren per SSH:** Verschlüsselte Rechner (Standard bei Servern) lassen sich beim Start über `ssh -p 2222 root@<rechner>`
   entsperren – nach dem Login fragt der Rechner direkt nach dem LUKS-Passwort. Läuft nur über Kabel; der Fingerabdruck des
@@ -179,7 +181,7 @@ dann die Programme darin (vorausgewählt ist jeweils das Übliche, **fett** unte
 |---|---|
 | Video und Musik (`SW_MEDIA`) | **VLC**, **Codecs** (FFmpeg, GStreamer good/bad/ugly/libav), mpv, Strawberry, Spotify, Audacity, OBS Studio, Kdenlive, HandBrake |
 | Office und Dokumente (`SW_OFFICE`) | **LibreOffice** (mit Rechtschreibprüfung de/en), ONLYOFFICE, Okular, PDF Arranger, Xournal++, Obsidian, Joplin |
-| Internet und Dateien (`SW_WEB`) | Chromium, Google Chrome, Brave, Tor Browser, Nextcloud, qBittorrent, FileZilla, LocalSend |
+| Internet und Dateien (`SW_WEB`) | Chromium, Google Chrome, Brave, Tor Browser, Nextcloud, qBittorrent, FileZilla, Tailscale, LocalSend |
 | Kommunikation (`SW_CHAT`) | **Thunderbird**, Signal, Telegram, Element, Discord, Vesktop, Zoom, Teams (inoffiziell), Slack |
 | Grafik, Foto und 3D (`SW_GRAPHICS`) | **GIMP**, Inkscape, Krita, darktable, Blender, FreeCAD |
 | 3D-Druck (`SW_PRINT`) | **PrusaSlicer**, **OrcaSlicer**, Anycubic Slicer Next (Flatpak), UltiMaker Cura, Bambu Studio, OpenSCAD, MeshLab, Pronterface |
