@@ -184,7 +184,7 @@ dann die Programme darin (vorausgewählt ist jeweils das Übliche, **fett** unte
 | Internet und Dateien (`SW_WEB`) | Chromium, Google Chrome, Brave, Tor Browser, Nextcloud, qBittorrent, FileZilla, Tailscale, LocalSend |
 | Kommunikation (`SW_CHAT`) | **Thunderbird**, Signal, Telegram, Element, Discord, Vesktop, Zoom, Teams (inoffiziell), Slack |
 | Grafik, Foto und 3D (`SW_GRAPHICS`) | **GIMP**, Inkscape, Krita, darktable, Blender, FreeCAD |
-| 3D-Druck (`SW_PRINT`) | **PrusaSlicer**, **OrcaSlicer**, Anycubic Slicer Next (Flatpak), UltiMaker Cura, Bambu Studio, OpenSCAD, MeshLab, Pronterface |
+| 3D-Druck (`SW_PRINT`) | **PrusaSlicer**, **OrcaSlicer** (Flatpak von Flathub), Anycubic Slicer Next (Flatpak), UltiMaker Cura, Bambu Studio, OpenSCAD, MeshLab, Pronterface |
 | Entwicklung (`SW_DEV`) | **VS Code**, VSCodium, Zed, Neovim, C/C++-Werkzeuge, Python mit uv, Node.js, Rust, Go, **gh und lazygit**, DBeaver, Bruno |
 | System und Werkzeuge (`SW_TOOLS`) | **KeePassXC**, Bitwarden, Remmina, RustDesk, Wireshark, GParted, Impression, Mission Center, Wine mit winetricks, Bottles |
 
@@ -195,11 +195,12 @@ Wireshark: Der Hauptbenutzer kommt in die Gruppe `wireshark` und darf ohne root 
 Pronterface: Der Hauptbenutzer kommt in die Gruppe `dialout` (Drucker per USB).
 Bambu Studio liegt nicht im Binär-Cache und wird bei der Installation kompiliert.
 
-**Anycubic Slicer Next** gibt es nicht in nixpkgs. Das Skript nutzt das inoffizielle Flatpak von
+**Flatpaks:** OrcaSlicer kommt von Flathub, Anycubic Slicer Next (nicht in nixpkgs) aus dem inoffiziellen Flatpak-Repo
 [RoccoRakete/anycubic-slicer-next-flatpak](https://github.com/RoccoRakete/anycubic-slicer-next-flatpak)
-(signiertes Repo, Laufzeit von Flathub) und schaltet dafür Flatpak ein. Installiert wird es beim ersten Start
-mit Internet durch den Dienst `flatpak-repo` (ca. 600 MB, Fortschritt: `journalctl -fu flatpak-repo`).
-Updates kommen mit `flatpak update` oder über die Software-Verwaltung des Desktops.
+(signiert, Laufzeit von Flathub). Ist eins davon gewählt, schaltet das Skript Flatpak ein. Installiert werden sie beim
+ersten Start mit Internet durch den Dienst `flatpak-repo`; die GNOME-Laufzeit teilen sich beide (zusammen etwa 800 MB,
+Fortschritt: `journalctl -fu flatpak-repo`). Updates kommen mit `flatpak update` oder über die Software-Verwaltung.
+Weitere Flatpaks lassen sich in `SW_APPS` mit `flatpak:<Repo>:<App-ID>` eintragen, eigene Repos in `FLATPAK_REMOTES`.
 
 ## Secure Boot (nur mit UKI)
 

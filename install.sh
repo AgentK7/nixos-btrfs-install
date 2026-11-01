@@ -814,7 +814,8 @@ SW_CATS=(
   "SW_TOOLS|System und Werkzeuge"
 )
 # Kategorie|Variable|Vorauswahl j/n|Merkmale|Pakete|Text
-# Merkmale: u = unfrei, p = NixOS-Modul programs.<Paket>.enable statt Paket; Paket "-" = Sonderfall weiter unten
+# Merkmale: u = unfrei, p = NixOS-Modul programs.<Paket>.enable statt Paket
+# Paket "flatpak:<Repo>:<App-ID>" = Flatpak (Flathub oder Repo aus FLATPAK_REMOTES), "-" = Sonderfall weiter unten
 SW_APPS=(
   "SW_MEDIA|APP_VLC|j||vlc|VLC (spielt fast alle Formate ab)"
   "SW_MEDIA|APP_CODECS|j||ffmpeg-full|Codecs (FFmpeg, GStreamer für H.264/H.265, AAC, MP3 …)"
@@ -857,8 +858,8 @@ SW_APPS=(
   "SW_GRAPHICS|APP_BLENDER|n||blender|Blender (3D)"
   "SW_GRAPHICS|APP_FREECAD|n||freecad|FreeCAD (CAD)"
   "SW_PRINT|APP_PRUSASLICER|j||prusa-slicer|PrusaSlicer"
-  "SW_PRINT|APP_ORCASLICER|j||orca-slicer|OrcaSlicer (Profile für Bambu, Creality, Anycubic, Voron …)"
-  "SW_PRINT|APP_ANYCUBIC|n||-|Anycubic Slicer Next (inoffizielles Flatpak, kommt beim ersten Start mit Internet)"
+  "SW_PRINT|APP_ORCASLICER|j||flatpak:flathub:com.orcaslicer.OrcaSlicer|OrcaSlicer (Flatpak von Flathub; Profile für Bambu, Creality, Anycubic, Voron …)"
+  "SW_PRINT|APP_ANYCUBIC|n||flatpak:anycubic-slicer-next:io.github.roccorakete.AnycubicSlicerNext|Anycubic Slicer Next (inoffizielles Flatpak)"
   "SW_PRINT|APP_CURA|n||cura-appimage|UltiMaker Cura"
   "SW_PRINT|APP_BAMBU|n|u|bambu-studio|Bambu Studio (wird beim Installieren kompiliert, dauert lange)"
   "SW_PRINT|APP_OPENSCAD|n||openscad-unstable|OpenSCAD (Modelle per Code, aktuelle Entwicklerversion)"
@@ -887,6 +888,21 @@ SW_APPS=(
   "SW_TOOLS|APP_WINE|n||wineWow64Packages.stable winetricks|Wine mit winetricks (Windows-Programme)"
   "SW_TOOLS|APP_BOTTLES|n|u|bottles|Bottles (Windows-Programme in eigenen Umgebungen)"
 )
+# Flatpak-Repos außer Flathub: Name|URL|Herkunft
+FLATPAK_REMOTES=(
+  "anycubic-slicer-next|https://roccorakete.github.io/anycubic-slicer-next-flatpak/index.flatpakrepo|inoffiziell, github.com/RoccoRakete/anycubic-slicer-next-flatpak"
+)
+# Gewählte Flatpak-Programme, je Zeile: Repo App-ID Name
+sw_flatpaks() {
+  local e v pkgs text r
+  for e in "${SW_APPS[@]}"; do
+    IFS='|' read -r _ v _ _ pkgs text <<<"$e"
+    if [[ $pkgs == flatpak:* && ${!v-0} == 1 ]]; then
+      r=${pkgs#flatpak:}
+      printf '%s %s %s\n' "${r%%:*}" "${r#*:}" "${text%% (*}"
+    fi
+  done
+}
 ANSWER_VARS+=(SOFTWARE)
 for e in "${SW_CATS[@]}"; do ANSWER_VARS+=("${e%%|*}"); done
 for e in "${SW_APPS[@]}"; do IFS='|' read -r _ v _ <<<"$e"; ANSWER_VARS+=("$v"); done
@@ -1447,7 +1463,7 @@ for ce in "${SW_CATS[@]}"; do
   for e in "${SW_APPS[@]}"; do
     IFS='|' read -r ac v _ flags pkgs text <<<"$e"
     if [[ $ac != "$c" || ${!v-0} != 1 ]]; then continue; fi
-    if [[ $pkgs == - ]]; then continue; fi   # Sonderfall: Anycubic in FLATPAK_NIX, Tailscale in VPN_NIX
+    if [[ $pkgs == - || $pkgs == flatpak:* ]]; then continue; fi   # Tailscale in VPN_NIX, Flatpaks in FLATPAK_NIX
     if [[ $flags == *p* ]]; then
       SW_NIX+="${SW_NIX:+$'\n'}  programs.$pkgs.enable = true;  # ${text}"
       continue
@@ -1758,17 +1774,20 @@ if (( FLATPAK )); then
     after = [ "network-online.target" ];
     path = [ pkgs.flatpak ];
     script = "flatpak remote-add --if-not-exists flathub https://dl.flathub.org/repo/flathub.flatpakrepo";'
-  if (( APP_ANYCUBIC )); then
-    FLATPAK_NIX+=$'\n'"$(cat <<'NIX'
-    # Anycubic Slicer Next: inoffizielles Flatpak (github.com/RoccoRakete/anycubic-slicer-next-flatpak),
-    # signiertes Repo, Laufzeit von Flathub; Updates mit "flatpak update" oder der Software-Verwaltung
-    postStart = ''
-      flatpak remote-add --if-not-exists anycubic-slicer-next https://roccorakete.github.io/anycubic-slicer-next-flatpak/index.flatpakrepo
-      flatpak info io.github.roccorakete.AnycubicSlicerNext >/dev/null 2>&1 \
-        || flatpak install --noninteractive anycubic-slicer-next io.github.roccorakete.AnycubicSlicerNext
-    '';
-NIX
-)"
+  fp_post=""
+  for rm in "${FLATPAK_REMOTES[@]}"; do
+    IFS='|' read -r rname rurl rnote <<<"$rm"
+    if sw_flatpaks | grep -q "^$rname "; then
+      fp_post+="      # $rnote"$'\n'"      flatpak remote-add --if-not-exists $rname $rurl"$'\n'
+    fi
+  done
+  while read -r rname rid _; do
+    if [[ -n $rid ]]; then fp_post+="      flatpak info $rid >/dev/null 2>&1 || flatpak install --noninteractive $rname $rid"$'\n'; fi
+  done <<<"$(sw_flatpaks)"
+  if [[ -n $fp_post ]]; then
+    FLATPAK_NIX+=$'\n'"    # Programme als Flatpak, einmalig beim ersten Start mit Internet;"
+    FLATPAK_NIX+=$'\n'"    # Updates mit \"flatpak update\" oder der Software-Verwaltung des Desktops"
+    FLATPAK_NIX+=$'\n'"    postStart = ''"$'\n'"$fp_post    '';"
   fi
   FLATPAK_NIX+='
     serviceConfig = {
@@ -2531,8 +2550,9 @@ for ce in "${SW_CATS[@]}"; do
   done
   if [[ -n $names ]]; then SW_SUMMARY+=$'\n'"    ${ce#*|}: $names"; fi
 done
-if (( APP_ANYCUBIC && ! FLATPAK )); then
-  note "Anycubic Slicer Next kommt als Flatpak, Flatpak mit Flathub wird aktiviert."
+FP_NAMES=$(sw_flatpaks | cut -d' ' -f3- | paste -sd, - | sed 's/,/, /g')
+if [[ -n $FP_NAMES ]] && (( ! FLATPAK )); then
+  note "$FP_NAMES als Flatpak gewählt, Flatpak mit Flathub wird aktiviert."
   FLATPAK=1
 fi
 
@@ -2941,7 +2961,7 @@ $(case $DISK2_MODE in
   Schriften:      $(if [[ $DESKTOP != none ]]; then echo "Noto inkl. Emoji/CJK, JetBrains Mono Nerd Font"; else echo "Standard"; fi)
   Plattenwarnung: $(if (( IS_VM )); then echo "nein (virtuelle Maschine)"; else echo "smartd"; fi)
   Audio:          PipeWire (ALSA + 32 bit, Pulse, JACK)
-  Flatpak:        $(yn "$FLATPAK")$(if (( FLATPAK )); then echo " (Flathub$(if (( APP_ANYCUBIC )); then echo ", Anycubic Slicer Next"; fi))"; fi)
+  Flatpak:        $(yn "$FLATPAK")$(if (( FLATPAK )); then echo " (Flathub${FP_NAMES:+; Programme: $FP_NAMES})"; fi)
   Unfree:         $(yn "$UNFREE")
   Verschlüsselt:  $(yn "$ENCRYPT")$(if (( TPM2 )); then echo ", TPM2 beim ersten Start mit Secure Boot"; fi)$(if (( SSH_UNLOCK )); then echo ", entsperren per SSH (Port 2222)"; fi)
   YubiKey/FIDO2:  Verschlüsselung $(yn "$FIDO2_LUKS"), sudo $(yn "$FIDO2_SUDO")
@@ -3495,8 +3515,8 @@ fi
 if [[ $GPU == nvidia-prime ]]; then
   echo "  NVIDIA-GPU für ein Programm nutzen: nvidia-offload <programm>"
 fi
-if (( APP_ANYCUBIC )); then
-  echo "  Anycubic Slicer Next wird beim ersten Start mit Internet als Flatpak installiert (ca. 600 MB)."
+if [[ -n $FP_NAMES ]]; then
+  echo "  Flatpak beim ersten Start mit Internet: $FP_NAMES (mit GNOME-Laufzeit einige hundert MB)."
   echo "    Fortschritt: journalctl -fu flatpak-repo"
 fi
 if (( EMU_PS2 || EMU_PS3 || EMU_SWITCH || EMU_XBOX || EMU_DC || RETROARCH )); then
