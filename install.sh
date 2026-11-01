@@ -47,10 +47,13 @@
 #   GIT_NAME, GIT_EMAIL  Git-Identität (nur mit home-manager)
 #   EXTRA_USERS  weitere Benutzer, durch Leerzeichen getrennt
 #   NIX_HOSTNAME, NIX_USER, SWAP_GB
-#   Ja/Nein (j/n): PRINTING BLUETOOTH STEAM LIBVIRT FLATPAK UNFREE ENCRYPT UKI TPM2 SILENT
+#   Ja/Nein (j/n): PRINTING BLUETOOTH LIBVIRT FLATPAK UNFREE ENCRYPT UKI TPM2 SILENT
 #                  SNAPPER BACKUP HIBERNATE AUTOUPDATE OHMYZSH SSHD NV_OPEN FINGERPRINT
 #                  FIDO2_LUKS FIDO2_SUDO RESCUE HOME_MANAGER FAIL2BAN WIFI_COPY ADVANCED
 #                  SB_ENROLL (Secure-Boot-Schlüssel gleich eintragen) SSH_UNLOCK (LUKS per SSH entsperren)
+#                  GAMING (nur mit Desktop), darin STEAM RETROARCH und die Emulatoren
+#                  EMU_PS2 EMU_PS3 EMU_PSP EMU_GCWII EMU_WIIU EMU_SWITCH EMU_3DS EMU_NDS
+#                  EMU_GBA EMU_N64 EMU_XBOX EMU_DC
 #                  DISK_FORCE, DISK2_FORCE (trotz SMART-Warnung installieren)
 # Ohne Abfrage, nur per Variable: ESP_GB (Größe von /boot in GiB, 1), COMPRESS (zstd), ZRAM (j),
 #   BOOT_MODE (uefi | bios; Standard: wie der USB-Stick gestartet wurde),
@@ -789,7 +792,13 @@ ANSWER_VARS=(CHANNEL KB LOCALE TIMEZONE DESKTOP DESKTOP_MODE GPU NV_OPEN KERNEL 
   STEAM SAMBA LIBVIRT CONTAINERS FLATPAK UNFREE ENCRYPT UKI TPM2 SILENT SNAPPER BACKUP BACKUP_REPO
   HIBERNATE LID AUTOUPDATE LOGIN_SHELL OHMYZSH SSHD SSH_KEYS NIX_HOSTNAME NIX_USER EXTRA_USERS
   SWAP_GB ZRAM ESP_GB COMPRESS FINGERPRINT FIDO2_LUKS FIDO2_SUDO RESCUE HOME_MANAGER GIT_NAME
-  GIT_EMAIL FAIL2BAN SB_ENROLL SSH_UNLOCK NET_MODE NET_IF NET_ADDR NET_GW NET_DNS NET_ADDR6 NET_GW6 VPN)
+  GIT_EMAIL FAIL2BAN SB_ENROLL SSH_UNLOCK NET_MODE NET_IF NET_ADDR NET_GW NET_DNS NET_ADDR6 NET_GW6 VPN
+  GAMING RETROARCH EMU_PS2 EMU_PS3 EMU_PSP EMU_GCWII EMU_WIIU EMU_SWITCH EMU_3DS EMU_NDS EMU_GBA
+  EMU_N64 EMU_XBOX EMU_DC)
+# Gaming-Auswahl: Variable|Kurzname für die Zusammenfassung
+GAME_ITEMS=(STEAM\|Steam RETROARCH\|RetroArch EMU_PS2\|PS2 EMU_PS3\|PS3 EMU_PSP\|PSP EMU_GCWII\|GameCube/Wii
+  EMU_WIIU\|"Wii U" EMU_SWITCH\|Switch EMU_3DS\|3DS EMU_NDS\|DS EMU_GBA\|"GB/GBC/GBA" EMU_N64\|N64
+  EMU_XBOX\|Xbox EMU_DC\|Dreamcast)
 # Nicht gespeichert, weil rechnerspezifisch: DISK, DISK2, HW_PROFILE, INSTALL_MODE, DISK2_MODE
 # Geheime Werte, nur aus der Passwortdatei (PASSWORT_DATEI), werden nie gespeichert
 SECRET_VARS=(LUKS_PASS ROOT_PASS ROOT_HASH USER_PASS USER_HASH EXTRA_PASS EXTRA_HASH SAMBA_PASS
@@ -1287,10 +1296,54 @@ if [[ $DESKTOP != none ]]; then
     EXTRAS_NIX+='  hardware.bluetooth.enable = false;'
   fi
 fi
-if (( STEAM )); then
-  EXTRAS_NIX+='
-  programs.steam.enable = true;
-  programs.gamemode.enable = true;  # Spiele mit "gamemoderun %command%" starten'
+
+# Spiele und Emulatoren
+GAMING_NIX=""; GAMING_PKGS=""
+if (( GAMING )); then
+  GAMING_NIX='  # Controller ohne root: Steam-Hardware, DualShock/DualSense, Switch Pro, Joy-Cons, 8BitDo u. a.
+  hardware.steam-hardware.enable = true;
+  services.udev.packages = with pkgs; [
+    game-devices-udev-rules'
+  if (( EMU_GCWII )); then
+    GAMING_NIX+='
+    dolphin-emu  # GameCube-Controller-Adapter, Bluetooth-Durchreichung für Wiimotes'
+  fi
+  GAMING_NIX+='
+  ];
+  programs.gamemode.enable = true;  # mehr Leistung beim Spielen: "gamemoderun <programm>"'
+  if (( STEAM )); then
+    GAMING_NIX+='
+  programs.steam.enable = true;     # in Steam: Startoptionen "gamemoderun %command%"'
+  fi
+  if (( RETROARCH )); then
+    GAMING_PKGS+='
+    # RetroArch mit Kernen für klassische Konsolen
+    (retroarch.withCores (cores: with cores; [
+      mesen            # NES
+      bsnes            # SNES
+      mupen64plus      # Nintendo 64
+      genesis-plus-gx  # Mega Drive, Master System, Game Gear, Mega-CD
+      swanstation      # PlayStation 1
+      mgba             # Game Boy, Game Boy Color, Game Boy Advance
+    ]))'
+  fi
+  if (( EMU_PS2 || EMU_PS3 || EMU_PSP || EMU_GCWII || EMU_WIIU || EMU_SWITCH || EMU_3DS || EMU_NDS \
+        || EMU_GBA || EMU_N64 || EMU_XBOX || EMU_DC )); then
+    GAMING_PKGS+='
+    # Emulatoren (BIOS, Firmware und Schlüssel aus den eigenen Konsolen)'
+  fi
+  if (( EMU_PS2 ));    then GAMING_PKGS+=$'\n    pcsx2               # PlayStation 2'; fi
+  if (( EMU_PS3 ));    then GAMING_PKGS+=$'\n    rpcs3               # PlayStation 3'; fi
+  if (( EMU_PSP ));    then GAMING_PKGS+=$'\n    ppsspp              # PSP'; fi
+  if (( EMU_GCWII ));  then GAMING_PKGS+=$'\n    dolphin-emu         # GameCube, Wii'; fi
+  if (( EMU_WIIU ));   then GAMING_PKGS+=$'\n    cemu                # Wii U'; fi
+  if (( EMU_SWITCH )); then GAMING_PKGS+=$'\n    ryubing             # Switch (Fork von Ryujinx)\n    eden                # Switch (Fork von Yuzu)'; fi
+  if (( EMU_3DS ));    then GAMING_PKGS+=$'\n    azahar              # 3DS (Nachfolger von Citra)'; fi
+  if (( EMU_NDS ));    then GAMING_PKGS+=$'\n    melonds             # Nintendo DS'; fi
+  if (( EMU_GBA ));    then GAMING_PKGS+=$'\n    mgba                # Game Boy, Game Boy Color, Game Boy Advance'; fi
+  if (( EMU_N64 ));    then GAMING_PKGS+=$'\n    rmg                 # Nintendo 64 (Rosalie\'s Mupen GUI)'; fi
+  if (( EMU_XBOX ));   then GAMING_PKGS+=$'\n    xemu                # Xbox (Classic)'; fi
+  if (( EMU_DC ));     then GAMING_PKGS+=$'\n    flycast             # Dreamcast'; fi
 fi
 
 # Avahi: Drucker, NAS und Rechner im Netz finden, Namen wie nas.local auflösen
@@ -1768,6 +1821,7 @@ if (( UKI )); then
     sbctl               # Schlüssel prüfen und in die Firmware eintragen'
 fi
 PKG_NIX+="$DESKTOP_PKGS"
+PKG_NIX+="$GAMING_PKGS"
 PKG_NIX+='
   ];'
 
@@ -1790,7 +1844,8 @@ PKG_NIX+='
   emit "Tastatur"                            "$KB_NIX"
   emit "Desktop"                             "$DESKTOP_NIX"
   emit "Grafik"                              "$GPU_NIX"
-  emit "Drucken, Bluetooth, Spiele"          "$EXTRAS_NIX"
+  emit "Drucken und Bluetooth"              "$EXTRAS_NIX"
+  emit "Spiele und Emulatoren"              "$GAMING_NIX"
   emit "Netzwerkdienste finden (mDNS)"       "$AVAHI_NIX"
   emit "VPN und Schutz"                      "$VPN_NIX"
   emit "Samba-Freigabe"                      "$SAMBA_NIX"
@@ -2221,12 +2276,56 @@ if [[ $DESKTOP != none ]]; then
   ask_multi "Desktop-Extras" \
     PRINTING  "Drucker (CUPS, Netzwerkdrucker automatisch finden)" j \
     BLUETOOTH "Bluetooth" j \
-    STEAM     "Steam und Gamemode" n \
     FLATPAK   "Flatpak mit Flathub" j
 else
-  PRINTING=0; BLUETOOTH=0; STEAM=0
+  PRINTING=0; BLUETOOTH=0
   FLATPAK=0   # Flatpak braucht XDG-Portale, die erst ein Desktop mitbringt
 fi
+
+# ---------- Gaming ----------
+# Ältere Antwortdateien kennen nur STEAM=j, ohne GAMING
+if [[ -z ${GAMING-} ]]; then
+  for it in "${GAME_ITEMS[@]}"; do
+    v=${it%%|*}
+    if is_yes "${!v-}"; then GAMING=j; fi
+  done
+fi
+if [[ $DESKTOP != none ]]; then
+  ask_yn GAMING "Gaming einrichten (Steam, RetroArch, Emulatoren auswählen)?" n
+else
+  GAMING=0
+fi
+if (( GAMING )); then
+  game_opts=()
+  # Steam, PCSX2 und Cemu gibt es nur für x86_64
+  if [[ $(uname -m) == x86_64 ]]; then game_opts+=(STEAM "Steam (mit Proton für Windows-Spiele)" j); fi
+  game_opts+=(RETROARCH "RetroArch (NES, SNES, N64, Mega Drive, PS1, Game Boy)" n)
+  if [[ $(uname -m) == x86_64 ]]; then game_opts+=(EMU_PS2 "PlayStation 2 (PCSX2)" n); fi
+  game_opts+=(
+    EMU_PS3    "PlayStation 3 (RPCS3, wird beim Installieren kompiliert, dauert lange)" n
+    EMU_PSP    "PSP (PPSSPP)" n
+    EMU_GCWII  "GameCube / Wii (Dolphin)" n)
+  if [[ $(uname -m) == x86_64 ]]; then game_opts+=(EMU_WIIU "Wii U (Cemu)" n); fi
+  game_opts+=(
+    EMU_SWITCH "Switch (Ryubing und Eden)" n
+    EMU_3DS    "3DS (Azahar)" n
+    EMU_NDS    "Nintendo DS (melonDS)" n
+    EMU_GBA    "Game Boy / Color / Advance (mGBA)" n
+    EMU_N64    "Nintendo 64 (RMG)" n
+    EMU_XBOX   "Xbox Classic (xemu)" n
+    EMU_DC     "Dreamcast (Flycast)" n)
+  ask_multi "Gaming: Steam, RetroArch und Emulatoren" "${game_opts[@]}"
+fi
+# Nicht angeboten oder nicht gewählt = aus (ask_multi hat Gewähltes auf 1 gesetzt)
+GAME_SUMMARY=""
+for it in "${GAME_ITEMS[@]}"; do
+  v=${it%%|*}
+  if (( GAMING )) && [[ ${!v-} == 1 ]]; then
+    GAME_SUMMARY+="${GAME_SUMMARY:+, }${it#*|}"
+  else
+    printf -v "$v" 0
+  fi
+done
 
 # ---------- Samba ----------
 if [[ $DESKTOP != none ]]; then sdef=2; else sdef=1; fi
@@ -2298,8 +2397,8 @@ else
     SNAPPER "Automatische Snapshots für /home (snapper, stündlich, wird ausgedünnt)" j \
     RESCUE  "$(if [[ $BOOT_MODE == uefi ]]; then echo "Rettungseinträge im Bootmenü (Memtest86+, netboot.xyz)"; else echo "Memtest86+ im Bootmenü (Arbeitsspeicher testen)"; fi)" j
 fi
-if (( ! UNFREE )) && { [[ $GPU == nvidia || $GPU == nvidia-prime ]] || (( STEAM )); }; then
-  note "NVIDIA-Treiber und Steam brauchen unfreie Pakete, Unfree wird aktiviert."
+if (( ! UNFREE )) && { [[ $GPU == nvidia || $GPU == nvidia-prime ]] || (( STEAM || RETROARCH || EMU_PS3 )); }; then
+  note "NVIDIA-Treiber, Steam, RPCS3 und der Mega-Drive-Kern von RetroArch brauchen unfreie Pakete, Unfree wird aktiviert."
   UNFREE=1
 fi
 
@@ -2608,7 +2707,8 @@ $(case $DISK2_MODE in
   Grafik:         $GPU$(if [[ $GPU == nvidia* ]]; then echo " (offene Module: $(yn "$NV_OPEN"))"; fi)
   HW-Profil:      $(if [[ $HW_PROFILE != none ]]; then echo "nixos-hardware $HW_PROFILE"; else echo keins; fi)
   Fingerabdruck:  $(yn "$FINGERPRINT")
-  Extras:         Drucken $(yn "$PRINTING"), Bluetooth $(yn "$BLUETOOTH"), Steam $(yn "$STEAM")
+  Extras:         Drucken $(yn "$PRINTING"), Bluetooth $(yn "$BLUETOOTH")
+  Gaming:         $(if (( GAMING )); then echo "${GAME_SUMMARY:-nur Gamemode und Controller}"; else echo nein; fi)
   Samba:          $(case $SAMBA in none) echo nein ;; client) echo "Client (Netzlaufwerke nutzen)" ;; server) echo "Client + Freigabe ~/Freigabe" ;; esac)
   VMs/Container:  libvirt $(yn "$LIBVIRT"), Container: $CONTAINERS
   Schriften:      $(if [[ $DESKTOP != none ]]; then echo "Noto inkl. Emoji/CJK, JetBrains Mono Nerd Font"; else echo "Standard"; fi)
@@ -3167,6 +3267,10 @@ EOF
 fi
 if [[ $GPU == nvidia-prime ]]; then
   echo "  NVIDIA-GPU für ein Programm nutzen: nvidia-offload <programm>"
+fi
+if (( EMU_PS2 || EMU_PS3 || EMU_SWITCH || EMU_XBOX || EMU_DC || RETROARCH )); then
+  echo "  Emulatoren: BIOS, Firmware und Schlüssel aus den eigenen Konsolen in den Emulator laden"
+  echo "    (z. B. PS2-BIOS, PS3-Firmware, Switch prod.keys und Firmware, Xbox-BIOS und MCPX-ROM)."
 fi
 if (( BACKUP )); then
   echo "  Backup: täglich nach $BACKUP_REPO. Erster Lauf von Hand: sudo systemctl start restic-backups-home"

@@ -131,11 +131,42 @@ Vorher im anderen System Platz freigeben (Windows: Datenträgerverwaltung → Vo
 - Backup von `/home` mit restic auf einen anderen Rechner (SFTP, REST-Server, S3 …), täglich
 - VMs (libvirt, virt-manager), Container (Podman oder Docker)
 - PipeWire mit ALSA (inkl. 32 bit), PulseAudio und JACK
-- Optional: Drucken, Bluetooth, Steam + Gamemode, Samba (Client oder Server), Flatpak + Flathub, SSH nur mit Schlüssel
+- Optional: Drucken, Bluetooth, Samba (Client oder Server), Flatpak + Flathub, SSH nur mit Schlüssel
+- Gaming (nur mit Desktop, siehe unten): Steam, RetroArch und Emulatoren zum Ankreuzen, dazu Gamemode und Controller-Regeln
 - Schriften: Noto mit Emoji und CJK, JetBrains Mono Nerd Font
 - zsh mit fertiger `~/.zshrc`, optional oh-my-zsh; weitere Benutzer ohne Admin-Rechte
 - Optional [home-manager](https://github.com/nix-community/home-manager): Shell, Aliase und Git-Identität in `/etc/nixos/home.nix`
 - Systempakete: git, nixfmt, vim, btop, ripgrep, fd, bat, jq, tmux, ncdu, nvme-cli, inxi, dig, nmap, tcpdump, iperf3, nix-tree, nh, direnv u. a.
+
+## Gaming
+
+Mit Desktop fragt das Skript, ob Gaming eingerichtet werden soll. Dann gibt es eine Liste zum Ankreuzen:
+
+| Auswahl | Paket | Variable |
+|---|---|---|
+| Steam (mit Proton) | `programs.steam` | `STEAM` |
+| RetroArch: NES, SNES, N64, Mega Drive, PS1, GB/GBC/GBA | `retroarch.withCores` | `RETROARCH` |
+| PlayStation 2 | PCSX2 | `EMU_PS2` |
+| PlayStation 3 | RPCS3 | `EMU_PS3` |
+| PSP | PPSSPP | `EMU_PSP` |
+| GameCube / Wii | Dolphin | `EMU_GCWII` |
+| Wii U | Cemu | `EMU_WIIU` |
+| Switch | Ryubing und Eden | `EMU_SWITCH` |
+| 3DS | Azahar | `EMU_3DS` |
+| Nintendo DS | melonDS | `EMU_NDS` |
+| Game Boy / Color / Advance | mGBA | `EMU_GBA` |
+| Nintendo 64 | RMG | `EMU_N64` |
+| Xbox Classic | xemu | `EMU_XBOX` |
+| Dreamcast | Flycast | `EMU_DC` |
+
+Immer dabei: Gamemode (`gamemoderun <programm>`) und udev-Regeln, damit Controller ohne root funktionieren
+(Steam-Hardware, DualShock/DualSense, Switch Pro, Joy-Cons, 8BitDo; bei Dolphin auch der GameCube-Adapter).
+Steam, PCSX2 und Cemu gibt es nur auf x86_64. Steam, RPCS3 und der Mega-Drive-Kern von RetroArch schalten Unfree ein.
+RPCS3 liegt wegen der Lizenz nicht im Binär-Cache und wird bei der Installation kompiliert (dauert deutlich länger).
+Ohne Abfrage: `GAMING=j STEAM=j EMU_PS2=j EMU_SWITCH=j …`. Ältere Antwortdateien mit `STEAM=j` funktionieren weiter.
+
+BIOS, Firmware und Schlüssel (PS2-BIOS, PS3-Firmware, Switch `prod.keys` und Firmware, Xbox-BIOS und MCPX-ROM)
+liefert kein Paket mit, sie kommen aus den eigenen Konsolen.
 
 ## Secure Boot (nur mit UKI)
 
