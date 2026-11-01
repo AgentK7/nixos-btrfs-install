@@ -55,7 +55,7 @@
 #                  EMU_PS2 EMU_PS3 EMU_PSP EMU_GCWII EMU_WIIU EMU_SWITCH EMU_3DS EMU_NDS
 #                  EMU_GBA EMU_N64 EMU_XBOX EMU_DC
 #                  SOFTWARE (weitere Programme, nur mit Desktop), Kategorien SW_MEDIA SW_OFFICE SW_WEB
-#                  SW_CHAT SW_GRAPHICS SW_DEV SW_TOOLS, Programme APP_* (Liste: SW_APPS weiter unten)
+#                  SW_CHAT SW_GRAPHICS SW_PRINT SW_DEV SW_TOOLS, Programme APP_* (Liste: SW_APPS weiter unten)
 #                  DISK_FORCE, DISK2_FORCE (trotz SMART-Warnung installieren)
 # Ohne Abfrage, nur per Variable: ESP_GB (Größe von /boot in GiB, 1), COMPRESS (zstd), ZRAM (j),
 #   BOOT_MODE (uefi | bios; Standard: wie der USB-Stick gestartet wurde),
@@ -809,11 +809,12 @@ SW_CATS=(
   "SW_WEB|Internet und Dateien"
   "SW_CHAT|Kommunikation"
   "SW_GRAPHICS|Grafik, Foto und 3D"
+  "SW_PRINT|3D-Druck"
   "SW_DEV|Entwicklung"
   "SW_TOOLS|System und Werkzeuge"
 )
 # Kategorie|Variable|Vorauswahl j/n|Merkmale|Pakete|Text
-# Merkmale: u = unfrei, p = NixOS-Modul programs.<Paket>.enable statt Paket
+# Merkmale: u = unfrei, p = NixOS-Modul programs.<Paket>.enable statt Paket, f = Flatpak (Sonderfall unten)
 SW_APPS=(
   "SW_MEDIA|APP_VLC|j||vlc|VLC (spielt fast alle Formate ab)"
   "SW_MEDIA|APP_CODECS|j||ffmpeg-full|Codecs (FFmpeg, GStreamer für H.264/H.265, AAC, MP3 …)"
@@ -854,6 +855,14 @@ SW_APPS=(
   "SW_GRAPHICS|APP_DARKTABLE|n||darktable|darktable (RAW-Fotos entwickeln)"
   "SW_GRAPHICS|APP_BLENDER|n||blender|Blender (3D)"
   "SW_GRAPHICS|APP_FREECAD|n||freecad|FreeCAD (CAD)"
+  "SW_PRINT|APP_PRUSASLICER|j||prusa-slicer|PrusaSlicer"
+  "SW_PRINT|APP_ORCASLICER|j||orca-slicer|OrcaSlicer (Profile für Bambu, Creality, Anycubic, Voron …)"
+  "SW_PRINT|APP_ANYCUBIC|n|f|-|Anycubic Slicer Next (inoffizielles Flatpak, kommt beim ersten Start mit Internet)"
+  "SW_PRINT|APP_CURA|n||cura-appimage|UltiMaker Cura"
+  "SW_PRINT|APP_BAMBU|n|u|bambu-studio|Bambu Studio (wird beim Installieren kompiliert, dauert lange)"
+  "SW_PRINT|APP_OPENSCAD|n||openscad-unstable|OpenSCAD (Modelle per Code, aktuelle Entwicklerversion)"
+  "SW_PRINT|APP_MESHLAB|n||meshlab|MeshLab (3D-Netze reparieren und umwandeln)"
+  "SW_PRINT|APP_PRINTRUN|n||printrun|Pronterface (Drucker per USB steuern)"
   "SW_DEV|APP_VSCODE|j|u|vscode-fhs|Visual Studio Code (Erweiterungen mit eigenen Programmen laufen)"
   "SW_DEV|APP_VSCODIUM|n||vscodium|VSCodium (VS Code ohne Microsoft-Telemetrie)"
   "SW_DEV|APP_ZED|n||zed-editor|Zed (Editor)"
@@ -1434,6 +1443,7 @@ for ce in "${SW_CATS[@]}"; do
   for e in "${SW_APPS[@]}"; do
     IFS='|' read -r ac v _ flags pkgs text <<<"$e"
     if [[ $ac != "$c" || ${!v-0} != 1 ]]; then continue; fi
+    if [[ $flags == *f* ]]; then continue; fi   # Flatpak, siehe FLATPAK_NIX
     if [[ $flags == *p* ]]; then
       SW_NIX+="${SW_NIX:+$'\n'}  programs.$pkgs.enable = true;  # ${text}"
       continue
@@ -1655,6 +1665,7 @@ if [[ $NET_MODE == static ]]; then NMGRP=''; else NMGRP=' "networkmanager"'; fi
 ADMIN_GROUPS='"wheel"'"$NMGRP"' "audio"'
 if (( LIBVIRT )); then ADMIN_GROUPS+=' "libvirtd"'; fi
 if (( APP_WIRESHARK )); then ADMIN_GROUPS+=' "wireshark"'; fi
+if (( APP_PRINTRUN )); then ADMIN_GROUPS+=' "dialout"'; fi   # serielle Schnittstelle (USB-Drucker)
 if [[ $CONTAINERS == docker ]]; then ADMIN_GROUPS+=' "docker"'; fi
 USER_UID=""
 if [[ $DISK2_MODE == keep && $DATA_FSTYPE =~ ^(ntfs3|exfat|vfat)$ ]]; then
@@ -1738,7 +1749,20 @@ if (( FLATPAK )); then
     wants = [ "network-online.target" ];
     after = [ "network-online.target" ];
     path = [ pkgs.flatpak ];
-    script = "flatpak remote-add --if-not-exists flathub https://dl.flathub.org/repo/flathub.flatpakrepo";
+    script = "flatpak remote-add --if-not-exists flathub https://dl.flathub.org/repo/flathub.flatpakrepo";'
+  if (( APP_ANYCUBIC )); then
+    FLATPAK_NIX+=$'\n'"$(cat <<'NIX'
+    # Anycubic Slicer Next: inoffizielles Flatpak (github.com/RoccoRakete/anycubic-slicer-next-flatpak),
+    # signiertes Repo, Laufzeit von Flathub; Updates mit "flatpak update" oder der Software-Verwaltung
+    postStart = ''
+      flatpak remote-add --if-not-exists anycubic-slicer-next https://roccorakete.github.io/anycubic-slicer-next-flatpak/index.flatpakrepo
+      flatpak info io.github.roccorakete.AnycubicSlicerNext >/dev/null 2>&1 \
+        || flatpak install --noninteractive anycubic-slicer-next io.github.roccorakete.AnycubicSlicerNext
+    '';
+NIX
+)"
+  fi
+  FLATPAK_NIX+='
     serviceConfig = {
       Type = "oneshot";
       Restart = "on-failure";
@@ -2499,6 +2523,10 @@ for ce in "${SW_CATS[@]}"; do
   done
   if [[ -n $names ]]; then SW_SUMMARY+=$'\n'"    ${ce#*|}: $names"; fi
 done
+if (( APP_ANYCUBIC && ! FLATPAK )); then
+  note "Anycubic Slicer Next kommt als Flatpak, Flatpak mit Flathub wird aktiviert."
+  FLATPAK=1
+fi
 
 # ---------- Samba ----------
 if [[ $DESKTOP != none ]]; then sdef=2; else sdef=1; fi
@@ -2894,7 +2922,7 @@ $(case $DISK2_MODE in
   Schriften:      $(if [[ $DESKTOP != none ]]; then echo "Noto inkl. Emoji/CJK, JetBrains Mono Nerd Font"; else echo "Standard"; fi)
   Plattenwarnung: $(if (( IS_VM )); then echo "nein (virtuelle Maschine)"; else echo "smartd"; fi)
   Audio:          PipeWire (ALSA + 32 bit, Pulse, JACK)
-  Flatpak:        $(yn "$FLATPAK")$(if (( FLATPAK )); then echo " (Flathub)"; fi)
+  Flatpak:        $(yn "$FLATPAK")$(if (( FLATPAK )); then echo " (Flathub$(if (( APP_ANYCUBIC )); then echo ", Anycubic Slicer Next"; fi))"; fi)
   Unfree:         $(yn "$UNFREE")
   Verschlüsselt:  $(yn "$ENCRYPT")$(if (( TPM2 )); then echo ", TPM2 beim ersten Start mit Secure Boot"; fi)$(if (( SSH_UNLOCK )); then echo ", entsperren per SSH (Port 2222)"; fi)
   YubiKey/FIDO2:  Verschlüsselung $(yn "$FIDO2_LUKS"), sudo $(yn "$FIDO2_SUDO")
@@ -3447,6 +3475,10 @@ EOF
 fi
 if [[ $GPU == nvidia-prime ]]; then
   echo "  NVIDIA-GPU für ein Programm nutzen: nvidia-offload <programm>"
+fi
+if (( APP_ANYCUBIC )); then
+  echo "  Anycubic Slicer Next wird beim ersten Start mit Internet als Flatpak installiert (ca. 600 MB)."
+  echo "    Fortschritt: journalctl -fu flatpak-repo"
 fi
 if (( EMU_PS2 || EMU_PS3 || EMU_SWITCH || EMU_XBOX || EMU_DC || RETROARCH )); then
   echo "  Emulatoren: BIOS, Firmware und Schlüssel aus den eigenen Konsolen in den Emulator laden"

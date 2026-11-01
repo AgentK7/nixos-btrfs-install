@@ -182,6 +182,7 @@ dann die Programme darin (vorausgewählt ist jeweils das Übliche, **fett** unte
 | Internet und Dateien (`SW_WEB`) | Chromium, Google Chrome, Brave, Tor Browser, Nextcloud, qBittorrent, FileZilla, LocalSend |
 | Kommunikation (`SW_CHAT`) | **Thunderbird**, Signal, Telegram, Element, Discord, Vesktop, Zoom, Teams (inoffiziell), Slack |
 | Grafik, Foto und 3D (`SW_GRAPHICS`) | **GIMP**, Inkscape, Krita, darktable, Blender, FreeCAD |
+| 3D-Druck (`SW_PRINT`) | **PrusaSlicer**, **OrcaSlicer**, Anycubic Slicer Next (Flatpak), UltiMaker Cura, Bambu Studio, OpenSCAD, MeshLab, Pronterface |
 | Entwicklung (`SW_DEV`) | **VS Code**, VSCodium, Zed, Neovim, C/C++-Werkzeuge, Python mit uv, Node.js, Rust, Go, **gh und lazygit**, DBeaver, Bruno |
 | System und Werkzeuge (`SW_TOOLS`) | **KeePassXC**, Bitwarden, Remmina, RustDesk, Wireshark, GParted, Impression, Mission Center, Wine mit winetricks, Bottles |
 
@@ -189,6 +190,14 @@ Ohne Abfrage: `SOFTWARE=j APP_VLC=j APP_VSCODE=j …`, die Kategorie schaltet si
 stehen in der Liste `SW_APPS` im Skript. Unfreie Programme (VS Code, Chrome, Spotify, Discord, Zoom, Slack, Obsidian)
 schalten Unfree ein, ebenso Bottles (unter unstable mit unfreier Abhängigkeit).
 Wireshark: Der Hauptbenutzer kommt in die Gruppe `wireshark` und darf ohne root mitschneiden.
+Pronterface: Der Hauptbenutzer kommt in die Gruppe `dialout` (Drucker per USB).
+Bambu Studio liegt nicht im Binär-Cache und wird bei der Installation kompiliert.
+
+**Anycubic Slicer Next** gibt es nicht in nixpkgs. Das Skript nutzt das inoffizielle Flatpak von
+[RoccoRakete/anycubic-slicer-next-flatpak](https://github.com/RoccoRakete/anycubic-slicer-next-flatpak)
+(signiertes Repo, Laufzeit von Flathub) und schaltet dafür Flatpak ein. Installiert wird es beim ersten Start
+mit Internet durch den Dienst `flatpak-repo` (ca. 600 MB, Fortschritt: `journalctl -fu flatpak-repo`).
+Updates kommen mit `flatpak update` oder über die Software-Verwaltung des Desktops.
 
 ## Secure Boot (nur mit UKI)
 
