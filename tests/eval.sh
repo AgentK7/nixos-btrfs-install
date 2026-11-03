@@ -68,13 +68,11 @@ pruefe() {
     echo "OK     $name"
     grep -i 'evaluation warning\|^trace: warning' "$d/ergebnis.txt" | sort -u | while read -r w; do
       echo "  Warnung: $w"
-      if [[ -n ${GITHUB_ACTIONS-} ]]; then echo "::warning title=$name ($kanal)::$w"; fi
     done
     return 0
   else
     echo "FEHLER $name ($d/configuration.nix):"
     grep -v '^\s*$' "$d/ergebnis.txt" | grep -B2 -A8 'error:' | head -40 | sed 's/^/  /'
-    if [[ -n ${GITHUB_ACTIONS-} ]]; then echo "::error title=$name ($kanal)::$(grep -m1 -A3 'error:' "$d/ergebnis.txt" | tr '\n' ' ')"; fi
     return 1
   fi
 }

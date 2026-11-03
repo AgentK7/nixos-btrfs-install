@@ -1,7 +1,5 @@
 # nixos-btrfs-install
 
-[![Prüfung](https://github.com/AgentK7/nixos-btrfs-install/actions/workflows/pruefung.yml/badge.svg)](https://github.com/AgentK7/nixos-btrfs-install/actions/workflows/pruefung.yml)
-
 Interaktives Installer-Skript für NixOS auf btrfs, wahlweise aktuelles Release oder unstable.
 
 Im NixOS-Live-System als root (UEFI mit ausgeschaltetem Secure Boot oder Legacy-BIOS):
@@ -269,12 +267,11 @@ Kernel versehentlich signiert? Signatur aus sbctl entfernen (`sudo sbctl remove-
 `sudo rm /boot/EFI/nixos/kernel-*.efi` und `sudo nixos-rebuild boot` – lzbt installiert den
 Kernel dann im Original neu.
 
-## Prüfung (CI)
+## Prüfung
 
-Bei jedem Push, jedem Pull-Request und montags baut [`tests/eval.sh`](tests/eval.sh) die `configuration.nix` für
-mehrere Szenarien (`tests/szenarien/`) und wertet sie gegen das aktuelle Release und gegen unstable aus, dazu läuft
-shellcheck. So fallen entfernte oder umbenannte NixOS-Optionen auf, bevor eine Installation daran scheitert.
-Lokal: `tests/eval.sh release` oder `tests/eval.sh unstable server` (braucht Nix, installiert nichts).
+[`tests/eval.sh`](tests/eval.sh) baut die `configuration.nix` für mehrere Szenarien (`tests/szenarien/`) und wertet
+sie gegen das aktuelle Release oder unstable aus. So fallen entfernte oder umbenannte NixOS-Optionen auf, bevor eine
+Installation daran scheitert: `tests/eval.sh release` oder `tests/eval.sh unstable server` (braucht Nix, installiert nichts).
 
 ## Nach der Installation
 
