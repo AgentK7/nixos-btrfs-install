@@ -17,6 +17,12 @@ ohne Terminal (z. B. über eine Pipe) schaltet das Skript automatisch darauf um.
 
 Die erste Frage ist **„Erweiterte Optionen anzeigen?“** (Standard: nein). Nur dort gibt es Dual-Boot und die zweite Platte.
 
+In der Plattenauswahl stehen NVMe-SSDs oben (vorausgewählt ist die erste), USB-Sticks und Wechseldatenträger unten.
+
+Jede Frage lässt sich per Variable vorbelegen und wird dann übersprungen, z. B. die Zielplatte:
+`DISK=/dev/nvme0n1 sudo bash i.sh`. Die Variablen dürfen vor oder nach `sudo` stehen; `sudo` verwirft sie zwar,
+das Skript holt die bekannten Namen aber aus dem Aufruf zurück und zeigt an, welche es übernommen hat.
+
 Tastatur, Sprache und Zeitzone schlägt das Skript passend vor: aus dem Live-System (grafischer Stick) oder nach Standort
 über den GeoIP-Dienst von Ubuntu (`geoip.ubuntu.com`, abschaltbar mit `GEOIP=n`).
 

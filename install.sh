@@ -10,6 +10,7 @@
 #
 # Jede Abfrage lässt sich per Umgebungsvariable vorbelegen, z. B.:
 #   DISK=/dev/nvme0n1 CHANNEL=release KB=de DESKTOP=plasma NIX_USER=alice bash nixos-btrfs-install.sh
+# Auch vor sudo (DISK=/dev/nvme0n1 sudo bash i.sh): bekannte Namen werden aus dem sudo-Aufruf übernommen.
 #
 # Antworten einer früheren Installation wiederverwenden (dort unter /etc/nixos/install-antworten.env):
 #   ANTWORTEN=/pfad/install-antworten.env bash nixos-btrfs-install.sh
@@ -614,7 +615,19 @@ other_disks() {
     [[ $(lsblk -dno TYPE "$name") == disk ]] || continue
     [[ $name == "$1" || $name == "$LIVE_DEV" || $name == /dev/zram* ]] && continue
     printf '%s|%-16s %8s  %s\n' "$name" "$name" "$size" "${model:-}"
-  done
+  done | sort_disks
+}
+
+# Plattenliste "gerät|text" sortieren: NVMe oben, dann andere interne, USB und Wechseldatenträger unten
+sort_disks() {
+  local o d rank
+  while IFS= read -r o; do
+    d=${o%%|*}
+    if [[ $d == /dev/nvme* || $(lsblk -dno TRAN "$d" 2>/dev/null | tr -d ' ') == nvme ]]; then rank=0
+    elif [[ $(lsblk -dno TRAN "$d" 2>/dev/null | tr -d ' ') == usb || $(lsblk -dno RM "$d" 2>/dev/null | tr -d ' ') == 1 ]]; then rank=2
+    else rank=1; fi
+    printf '%s\t%s\n' "$rank" "$o"
+  done | sort -t$'\t' -k1,1n -k2,2V | cut -f2-
 }
 
 # Dual-Boot: größten freien Bereich und die vorhandene EFI-Partition auf $DISK finden
@@ -955,6 +968,29 @@ save_answers() {
     done
   } > "$f"
   chmod 600 "$f"
+}
+
+# "DISK=/dev/nvme0n1 sudo bash i.sh": sudo verwirft die Variablen vor dem Befehl. Sie stehen aber noch in
+# der Umgebung des sudo-Prozesses; bekannte, hier nicht gesetzte Namen werden von dort übernommen.
+IMPORT_VARS=("${ANSWER_VARS[@]}" "${SECRET_VARS[@]}" DISK DISK2 DISK2_MODE DATA_PART INSTALL_MODE HW_PROFILE
+  CONFIRM_DISK CONFIRM_DISK2 DISK_FORCE DISK2_FORCE AUTO AUTO_WARTEN ANTWORTEN PASSWORT_DATEI REBOOT TUI
+  BOOT_MODE GEOIP EXTRA_CA DB_MIN_GB ADVANCED WG_CONF WIFI_COPY)
+import_sudo_env() {
+  local pid=$PPID comm entry k names=""
+  [[ -n ${SUDO_USER-} ]] || return 0
+  while (( pid > 1 )); do
+    read -r comm 2>/dev/null < "/proc/$pid/comm" || return 0
+    if [[ $comm == sudo ]]; then break; fi
+    pid=$(awk '/^PPid:/ {print $2}' "/proc/$pid/status" 2>/dev/null) || return 0
+  done
+  (( pid > 1 )) || return 0
+  while IFS= read -r -d '' entry; do
+    k=${entry%%=*}
+    [[ $k =~ ^[A-Z][A-Z0-9_]*$ && " ${IMPORT_VARS[*]} " == *" $k "* && -z ${!k+x} ]] || continue
+    printf -v "$k" '%s' "${entry#*=}"
+    names+=" $k"
+  done 2>/dev/null < "/proc/$pid/environ" || true
+  if [[ -n $names ]]; then echo "  Vor sudo angegeben, übernommen:$names"; fi
 }
 
 # Platzhalter-Hardware für die Vorabprüfung der Konfiguration
@@ -2056,6 +2092,7 @@ PKG_NIX+='
 LOG=/tmp/nixos-install-$(date +%Y%m%d-%H%M%S).log
 exec > >(tee -a "$LOG") 2>&1
 echo "Protokoll: $LOG"
+import_sudo_env
 
 if [[ -n ${ANTWORTEN:-} ]]; then
   info "Lese Antworten aus $ANTWORTEN"
@@ -2166,12 +2203,12 @@ esac
 if (( AUTO_MODE )) && [[ -z ${DISK-} ]]; then die "Automatikmodus: DISK muss gesetzt sein."; fi
 
 DISK_OPTS=()
-while read -r name size model; do
-  [[ $name == /dev/zram* || $name == "$LIVE_DEV" ]] && continue
-  DISK_OPTS+=("$name|$(printf '%-16s %8s  %s' "$name" "$size" "${model:-}")")
-done < <(lsblk -dpno NAME,SIZE,MODEL -e 7,11 | while read -r n rest; do
-  if [[ $(lsblk -dno TYPE "$n") == disk ]]; then echo "$n $rest"; fi
-done)
+while IFS= read -r o; do
+  if [[ $o == /dev/zram* || ${o%%|*} == "$LIVE_DEV" ]]; then continue; fi
+  DISK_OPTS+=("$o")
+done < <(lsblk -dpno NAME,SIZE,MODEL -e 7,11 | while read -r n size model; do
+  if [[ $(lsblk -dno TYPE "$n") == disk ]]; then printf '%s|%-16s %8s  %s\n' "$n" "$n" "$size" "${model:-}"; fi
+done | sort_disks)
 (( ${#DISK_OPTS[@]} > 0 )) || die "Keine passende Platte gefunden."
 
 # DISK=auto: die einzige interne Platte (nicht USB, nicht wechselbar)
