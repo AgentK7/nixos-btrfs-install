@@ -58,7 +58,7 @@
 #                  SNAPPER BACKUP HIBERNATE AUTOUPDATE OHMYZSH SSHD NV_OPEN FINGERPRINT
 #                  FIDO2_LUKS FIDO2_SUDO RESCUE HOME_MANAGER FAIL2BAN WIFI_COPY ADVANCED
 #                  SB_ENROLL (Secure-Boot-Schlüssel gleich eintragen) SSH_UNLOCK (LUKS per SSH entsperren)
-#                  GAMING (nur mit Desktop), darin STEAM RETROARCH und die Emulatoren
+#                  GAMING (nur mit Desktop), darin STEAM RETROARCH und die Emulatoren; VR none | steamvr | wivrn | alvr | rift | monado
 #                  EMU_PS2 EMU_PS3 EMU_PSP EMU_GCWII EMU_WIIU EMU_SWITCH EMU_3DS EMU_NDS
 #                  EMU_GBA EMU_N64 EMU_XBOX EMU_DC
 #                  SOFTWARE (weitere Programme, nur mit Desktop), Kategorien SW_MEDIA SW_OFFICE SW_WEB
@@ -353,6 +353,92 @@ hw_candidates() {
       if (n > 0 && hit / n >= 0.75) printf "%.3f\t%d\t%s\t%s\n", hit / n, n, path, name
     }
   ' "$readme" | sort -t$'\t' -k1,1nr -k2,2nr
+}
+
+# riftlinux.nix (Oculus Rift CV1, github.com/AIIX/RiftLinux): Paket aus dem Release-Archiv; $1 = Zieldatei
+write_riftlinux_nix() {
+  sed -e "s/@VERSION@/$RIFT_VERSION/" -e "s/@SHA256@/$RIFT_SHA256/" > "$1" <<'NIX'
+# RiftLinux: Treiber für die Oculus Rift CV1 (SteamVR und OpenXR), https://github.com/AIIX/RiftLinux
+# Vom Installer erzeugt. Neue Version: version und sha256 (Zeile mit riftlinux-<version>-x86_64.tar.gz
+# aus SHA256SUMS des Releases) ändern, dann "sudo nixos-rebuild switch" und Steam einmal neu starten.
+{ pkgs, lib, ... }:
+let
+  version = "@VERSION@";
+  riftlinux = pkgs.stdenv.mkDerivation {
+    pname = "riftlinux";
+    inherit version;
+    src = pkgs.fetchurl {
+      url = "https://github.com/AIIX/RiftLinux/releases/download/v${version}/riftlinux-${version}-x86_64.tar.gz";
+      sha256 = "@SHA256@";
+    };
+    nativeBuildInputs = [ pkgs.autoPatchelfHook ];
+    # Bibliotheken für die eigene OpenXR-Laufzeit (ohne SteamVR)
+    buildInputs = with pkgs; [
+      systemdLibs libusb1 dbus vulkan-loader libdrm libx11 libxcb wayland SDL2 libglvnd
+    ];
+    # Der SteamVR-Treiber läuft in Steams eigenem Container und muss so bleiben, wie er gebaut wurde
+    dontStrip = true;
+    dontPatchELF = true;
+    dontAutoPatchelf = true;
+    installPhase = ''
+      runHook preInstall
+      mkdir -p $out
+      cp -r root/usr/. $out/
+      cp -r root/etc $out/etc
+      rm $out/lib/riftlinux/after-install.sh $out/lib/riftlinux/before-remove.sh $out/lib/riftlinux/users.sh
+      # /usr -> Nix-Store; die Kopie im Home-Verzeichnis beschreibbar machen (Dateien im Store sind schreibgeschützt)
+      substituteInPlace $out/bin/riftlinux-setup \
+        --replace-fail '#!/usr/bin/env python3' '#!${pkgs.python3}/bin/python3' \
+        --replace-fail 'NATIVE_DIR = "/usr/lib/riftlinux/native"' "NATIVE_DIR = \"$out/lib/riftlinux/native\"" \
+        --replace-fail 'SYSTEM_DIRS = ["/usr/lib/riftlinux/steamvr/rift-cv1",' "SYSTEM_DIRS = [\"$out/lib/riftlinux/steamvr/rift-cv1\", \"/usr/lib/riftlinux/steamvr/rift-cv1\"," \
+        --replace-fail 'shutil.copytree(system_dir, tmp, symlinks=False)' 'shutil.copytree(system_dir, tmp, symlinks=False); [os.chmod(q, os.stat(q).st_mode | 0o200) for q in [tmp] + [os.path.join(r, n) for r, ds, fs in os.walk(tmp) for n in ds + fs]]' \
+        --replace-fail 'stamp = tree_stamp(system_dir)' 'stamp = system_dir + "\n" + tree_stamp(system_dir)' \
+        --replace-fail '"/usr/libexec/rtkit-daemon"' '"${pkgs.rtkit}/libexec/rtkit-daemon"'  # "check" findet rtkit
+      substituteInPlace $out/bin/riftlinux-run $out/bin/riftlinux-runtime \
+        --replace-fail '/usr/lib/riftlinux/native' "$out/lib/riftlinux/native"
+      substituteInPlace $out/lib/systemd/user/riftlinux-register.service $out/etc/xdg/autostart/riftlinux-register.desktop \
+        --replace-fail /usr/bin/riftlinux-setup $out/bin/riftlinux-setup
+      substituteInPlace $out/lib/udev/rules.d/70-rift-cv1.rules --replace-fail '"/bin/sh ' '"${pkgs.runtimeShell} '
+      runHook postInstall
+    '';
+    postFixup = ''
+      autoPatchelf $out/lib/riftlinux/native
+    '';
+    meta = {
+      description = "Oculus Rift CV1 driver for Linux (SteamVR and OpenXR), based on Monado";
+      homepage = "https://github.com/AIIX/RiftLinux";
+      license = lib.licenses.boost;
+      platforms = [ "x86_64-linux" ];
+    };
+  };
+in
+{
+  environment.systemPackages = [ riftlinux pkgs.usbutils ];
+  services.udev.packages = [ riftlinux ];   # Zugriff auf Brille, Sensoren und Controller ohne root
+  systemd.packages = [ riftlinux ];         # meldet den Treiber bei SteamVR an, wenn die Brille angesteckt wird
+  systemd.user.services.riftlinux-register = {
+    wantedBy = [ "default.target" ];        # und bei jeder Anmeldung
+    path = [ pkgs.usbutils ];               # NixOS setzt für den Dienst einen eigenen, knappen PATH
+  };
+  security.rtkit.enable = true;             # Echtzeit-Priorität für Tracking und Compositor
+  environment.pathsToLink = [ "/share/kio" ];  # Dolphin: Rechtsklick "Run with the Rift"
+}
+NIX
+}
+
+# Neueste RiftLinux-Version und Prüfsumme des Archivs ermitteln (setzt RIFT_VERSION, RIFT_SHA256)
+riftlinux_release() {
+  local base=https://github.com/AIIX/RiftLinux/releases sums line
+  if [[ ${RIFT_VERSION-} =~ ^[0-9]+(\.[0-9]+)+$ && ${RIFT_SHA256-} =~ ^[0-9a-f]{64}$ ]]; then return 0; fi   # fest vorgegeben
+  if [[ -n ${RIFT_VERSION-} ]]; then
+    sums=$(curl -fsSL --max-time 30 "$base/download/v$RIFT_VERSION/SHA256SUMS") || return 1
+  else
+    sums=$(curl -fsSL --max-time 30 "$base/latest/download/SHA256SUMS") || return 1   # neuestes Release
+  fi
+  line=$(grep -E '^[0-9a-f]{64}  riftlinux-[0-9.]+-x86_64\.tar\.gz$' <<<"$sums" | head -n1) || return 1
+  RIFT_VERSION=${line##*riftlinux-}; RIFT_VERSION=${RIFT_VERSION%-x86_64.tar.gz}
+  if [[ -z ${RIFT_SHA256-} ]]; then RIFT_SHA256=${line%% *}; fi
+  [[ $RIFT_SHA256 =~ ^[0-9a-f]{64}$ ]]
 }
 
 # home.nix für home-manager; $1 = Zieldatei
@@ -817,7 +903,7 @@ ANSWER_VARS=(CHANNEL KB LOCALE TIMEZONE DESKTOP DESKTOP_MODE GPU NV_OPEN KERNEL 
   GIT_EMAIL FAIL2BAN SB_ENROLL SSH_UNLOCK NET_MODE NET_IF NET_ADDR NET_GW NET_DNS NET_ADDR6 NET_GW6 VPN
   GAMING RETROARCH EMU_PS2 EMU_PS3 EMU_PSP EMU_GCWII EMU_WIIU EMU_SWITCH EMU_3DS EMU_NDS EMU_GBA
   EMU_N64 EMU_XBOX EMU_DC ANANICY TUNING PRN_HP PRN_BROTHER PRN_EPSON PRN_GUTENPRINT PRN_FOO2ZJS PRN_SPLIX
-  CHARGE_LIMIT CHARGE_MAX DNS_TLS DNS_TLS_SERVERS WOL CACHE_URL CACHE_KEY)
+  CHARGE_LIMIT CHARGE_MAX DNS_TLS DNS_TLS_SERVERS WOL CACHE_URL CACHE_KEY VR)
 # Gaming-Auswahl: Variable|Kurzname für die Zusammenfassung
 GAME_ITEMS=(STEAM\|Steam RETROARCH\|RetroArch EMU_PS2\|PS2 EMU_PS3\|PS3 EMU_PSP\|PSP EMU_GCWII\|GameCube/Wii
   EMU_WIIU\|"Wii U" EMU_SWITCH\|Switch EMU_3DS\|3DS EMU_NDS\|DS EMU_GBA\|"GB/GBC/GBA" EMU_N64\|N64
@@ -1014,7 +1100,7 @@ auto_hostname() {
 # der Umgebung des sudo-Prozesses; bekannte, hier nicht gesetzte Namen werden von dort übernommen.
 IMPORT_VARS=("${ANSWER_VARS[@]}" "${SECRET_VARS[@]}" DISK DISK2 DISK2_MODE DATA_PART INSTALL_MODE HW_PROFILE
   CONFIRM_DISK CONFIRM_DISK2 DISK_FORCE DISK2_FORCE AUTO AUTO_WARTEN ANTWORTEN PASSWORT_DATEI REBOOT TUI
-  BOOT_MODE GEOIP EXTRA_CA DB_MIN_GB ADVANCED WG_CONF WIFI_COPY)
+  BOOT_MODE GEOIP EXTRA_CA DB_MIN_GB ADVANCED WG_CONF WIFI_COPY RIFT_VERSION RIFT_SHA256)
 import_sudo_env() {
   local pid=$PPID comm entry k names=""
   [[ -n ${SUDO_USER-} ]] || return 0
@@ -1070,6 +1156,10 @@ IMPORTS='    ./hardware-configuration.nix'
 if (( UKI )); then IMPORTS+=$'\n    lanzaboote.nixosModules.lanzaboote'; fi
 if [[ $HW_PROFILE != none ]]; then IMPORTS+=$'\n    <nixos-hardware/'"$HW_PROFILE"'>  # Anpassungen für dieses Modell (nixos-hardware)'; fi
 if (( HOME_MANAGER )); then IMPORTS+=$'\n    <home-manager/nixos>'; fi
+if [[ ${VR-none} == rift ]]; then
+  IMPORTS+=$'\n    ./riftlinux.nix  # Oculus Rift CV1 (RiftLinux)'
+  write_riftlinux_nix "$(dirname "$CFG")/riftlinux.nix"
+fi
 if (( UKI )); then
   HEADER_NIX='{ config, lib, pkgs, ... }:
 let
@@ -1626,6 +1716,35 @@ if (( GAMING )); then
   if (( EMU_N64 ));    then GAMING_PKGS+=$'\n    rmg                 # Nintendo 64 (Rosalie\'s Mupen GUI)'; fi
   if (( EMU_XBOX ));   then GAMING_PKGS+=$'\n    xemu                # Xbox (Classic)'; fi
   if (( EMU_DC ));     then GAMING_PKGS+=$'\n    flycast             # Dreamcast'; fi
+  # VR
+  case $VR in
+    wivrn)
+      GAMING_NIX+='
+  services.wivrn = {                # Quest, Pico u. a.: Client-App "WiVRn" auf der Brille, gleiches WLAN
+    enable = true;
+    openFirewall = true;
+    autoStart = true;               # Server läuft nach der Anmeldung
+    highPriority = true;            # flüssigere Reprojektion
+    steam.importOXRRuntimes = true; # Steam-Spiele finden WiVRn (OpenVR-Spiele über xrizer)
+  };' ;;
+    alvr)
+      GAMING_NIX+='
+  programs.alvr = {                 # Quest, Pico u. a.: "ALVR Dashboard" starten, Client auf der Brille
+    enable = true;
+    openFirewall = true;
+  };' ;;
+    monado)
+      GAMING_NIX+='
+  services.monado = {               # OpenXR für PC-Brillen: systemctl --user start monado
+    enable = true;
+    defaultRuntime = true;
+  };
+  environment.sessionVariables.PRESSURE_VESSEL_IMPORT_OPENXR_1_RUNTIMES = "1";  # Steam-Spiele finden Monado'
+      GAMING_PKGS+=$'\n    xrizer              # SteamVR-Spiele (OpenVR) auf Monado' ;;
+  esac
+  if [[ $VR != none ]]; then
+    GAMING_PKGS+=$'\n    wayvr               # Desktop und Fenster in der VR-Brille'
+  fi
 fi
 
 # Weitere Programme
@@ -2714,6 +2833,25 @@ if (( GAMING )); then
     EMU_DC     "Dreamcast (Flycast)" n
     ANANICY    "Prozess-Prioritäten automatisch anpassen (ananicy-cpp mit CachyOS-Regeln)" n)
   ask_multi "Gaming: Steam, RetroArch und Emulatoren" "${game_opts[@]}"
+  choose VR "VR-Brille?" 1 \
+    "none|Keine" \
+    "steamvr|Valve Index, HTC Vive, Bigscreen Beyond u. a. mit Lighthouse (SteamVR)" \
+    "wivrn|Meta Quest, Pico u. a. kabellos über WLAN (WiVRn, empfohlen für Quest)" \
+    "alvr|Meta Quest, Pico u. a. kabellos über SteamVR (ALVR)" \
+    "rift|Oculus Rift CV1 (RiftLinux)" \
+    "monado|Andere PC-Brillen: Rift S, Windows Mixed Reality u. a. (Monado)"
+  case $VR in none|steamvr|wivrn|alvr|rift|monado) ;; *) die "VR muss none, steamvr, wivrn, alvr, rift oder monado sein." ;; esac
+  if [[ $VR =~ ^(steamvr|alvr|rift)$ && ${STEAM-} != 1 ]]; then
+    note "$(case $VR in steamvr) echo "Diese Brille" ;; alvr) echo ALVR ;; rift) echo RiftLinux ;; esac) braucht SteamVR, Steam wird mitinstalliert."
+    STEAM=1
+  fi
+  if [[ $VR == rift ]]; then
+    echo "  Suche die aktuelle RiftLinux-Version ..."
+    riftlinux_release || die "RiftLinux-Version nicht ermittelbar (github.com/AIIX/RiftLinux). Netzwerk prüfen oder RIFT_VERSION und RIFT_SHA256 angeben. Es wurde nichts gelöscht."
+    echo "  RiftLinux $RIFT_VERSION"
+  fi
+else
+  VR=none
 fi
 # Nicht angeboten oder nicht gewählt = aus (ask_multi hat Gewähltes auf 1 gesetzt)
 GAME_SUMMARY=""
@@ -2725,6 +2863,13 @@ for it in "${GAME_ITEMS[@]}"; do
     printf -v "$v" 0
   fi
 done
+case $VR in
+  steamvr) GAME_SUMMARY+="${GAME_SUMMARY:+, }VR: SteamVR" ;;
+  wivrn)   GAME_SUMMARY+="${GAME_SUMMARY:+, }VR: WiVRn" ;;
+  alvr)    GAME_SUMMARY+="${GAME_SUMMARY:+, }VR: ALVR" ;;
+  rift)    GAME_SUMMARY+="${GAME_SUMMARY:+, }VR: RiftLinux $RIFT_VERSION" ;;
+  monado)  GAME_SUMMARY+="${GAME_SUMMARY:+, }VR: Monado" ;;
+esac
 
 # ---------- Weitere Programme ----------
 # Per Variable oder Antwortdatei gewählte Programme schalten ihre Kategorie mit ein
@@ -3812,6 +3957,28 @@ if [[ -n $FP_NAMES ]]; then
   echo "  Flatpak beim ersten Start mit Internet: $FP_NAMES (mit GNOME-Laufzeit einige hundert MB)."
   echo "    Fortschritt: journalctl -fu flatpak-repo"
 fi
+case $VR in
+  steamvr|alvr|rift)
+    echo "  VR: SteamVR in Steam installieren und einmal starten. Fragt es nach Rechten für den Compositor oder ruckelt es:"
+    echo "    sudo setcap CAP_SYS_NICE=eip ~/.local/share/Steam/steamapps/common/SteamVR/bin/linux64/vrcompositor-launcher"
+    echo "    Desktop in der Brille mit SteamVR: steam-run wayvr" ;;&
+  alvr)
+    echo "    ALVR: \"ALVR Dashboard\" starten und die ALVR-App auf der Brille installieren (gleiches WLAN)." ;;
+  rift)
+    echo "    RiftLinux $RIFT_VERSION: Steam einmal beenden und neu starten, Rift anstecken, aufsetzen: SteamVR startet."
+    echo "    Prüfen mit: riftlinux-setup check. Nicht \"riftlinux-setup fix\" nutzen, NixOS verwaltet /etc selbst."
+    echo "    Neue Version: /etc/nixos/riftlinux.nix (version und sha256), dann sudo nixos-rebuild switch."
+    if [[ $GPU == nvidia* ]]; then
+      echo "    NVIDIA unter Wayland mit VRR-Monitor: zerreißt das Bild in der Brille, in configuration.nix"
+      echo "      boot.extraModprobeConfig = \"options nvidia-modeset conceal_vrr_caps=1\"; (nimmt den Monitoren VRR)"
+    fi ;;
+  wivrn)
+    echo "  VR: App \"WiVRn\" auf der Brille installieren (Meta- bzw. Pico-Store), im selben WLAN verbinden."
+    echo "    Steam-Spiele laufen darüber, OpenVR-Spiele über xrizer." ;;
+  monado)
+    echo "  VR: Monado starten mit: systemctl --user start monado (OpenXR-Spiele laufen dann auf der Brille)."
+    echo "    SteamVR-Spiele über xrizer: https://wiki.nixos.org/wiki/VR" ;;
+esac
 if (( EMU_PS2 || EMU_PS3 || EMU_SWITCH || EMU_XBOX || EMU_DC || RETROARCH )); then
   echo "  Emulatoren: BIOS, Firmware und Schlüssel aus den eigenen Konsolen in den Emulator laden"
   echo "    (z. B. PS2-BIOS, PS3-Firmware, Switch prod.keys und Firmware, Xbox-BIOS und MCPX-ROM)."

@@ -211,6 +211,32 @@ Steam, RPCS3 und der Mega-Drive-Kern von RetroArch schalten Unfree ein.
 RPCS3 liegt wegen der Lizenz nicht im Binär-Cache und wird bei der Installation kompiliert (dauert deutlich länger).
 Ohne Abfrage: `GAMING=j STEAM=j EMU_PS2=j EMU_SWITCH=j …`. Ältere Antwortdateien mit `STEAM=j` funktionieren weiter.
 
+### VR
+
+Mit Gaming fragt das Skript nach der VR-Brille (`VR`):
+
+| Auswahl | Für | Eingerichtet wird |
+|---|---|---|
+| `steamvr` | Valve Index, HTC Vive, Bigscreen Beyond u. a. (Lighthouse) | Steam mit SteamVR, udev-Regeln |
+| `wivrn` | Meta Quest, Pico u. a. kabellos (empfohlen für Quest) | `services.wivrn` mit offener Firewall, Autostart, hoher Priorität; Steam- und OpenVR-Spiele (xrizer) laufen darüber |
+| `alvr` | Meta Quest, Pico u. a. kabellos über SteamVR | `programs.alvr` mit offener Firewall |
+| `rift` | Oculus Rift CV1 | [RiftLinux](https://github.com/AIIX/RiftLinux) (siehe unten) |
+| `monado` | andere PC-Brillen: Rift S, Windows Mixed Reality u. a. | `services.monado` als OpenXR-Standard, xrizer für SteamVR-Spiele |
+
+Immer dabei: [WayVR](https://github.com/wlx-team/wayvr) für Desktop und Fenster in der Brille (mit SteamVR: `steam-run wayvr`).
+SteamVR braucht auf NixOS einmal von Hand: `sudo setcap CAP_SYS_NICE=eip ~/.local/share/Steam/steamapps/common/SteamVR/bin/linux64/vrcompositor-launcher`.
+
+**RiftLinux** (Oculus Rift CV1: Brille, Constellation-Sensoren, Touch-Controller, SteamVR und OpenXR) gibt es nicht in nixpkgs.
+Das Skript holt die neueste Version vom Releases-Bereich (oder `RIFT_VERSION`, `RIFT_SHA256`) und schreibt
+`/etc/nixos/riftlinux.nix`: ein Paket aus dem offiziellen Archiv mit Prüfsumme, die udev-Regeln, die Anmeldung bei SteamVR
+beim Einstecken und Anmelden, und RealtimeKit. Der SteamVR-Treiber bleibt unverändert (er läuft in Steams eigenem Container),
+nur die eigene OpenXR-Laufzeit wird an NixOS angepasst. Zwei kleine Änderungen am Skript `riftlinux-setup` sind nötig:
+Es findet den Treiber im Nix-Store, und seine Kopie im Home-Verzeichnis wird beschreibbar (sonst scheitert die Anmeldung,
+weil Dateien im Store schreibgeschützt sind). Danach: Steam einmal neu starten, Rift anstecken, aufsetzen.
+`riftlinux-setup check` funktioniert, `riftlinux-setup fix` nicht (NixOS verwaltet `/etc` selbst). Neue Version: `version`
+und `sha256` in `/etc/nixos/riftlinux.nix` ändern, dann `sudo nixos-rebuild switch`.
+Für ein schon installiertes NixOS gibt es `install-riftlinux.sh` (nächster Abschnitt).
+
 BIOS, Firmware und Schlüssel (PS2-BIOS, PS3-Firmware, Switch `prod.keys` und Firmware, Xbox-BIOS und MCPX-ROM)
 liefert kein Paket mit, sie kommen aus den eigenen Konsolen.
 
