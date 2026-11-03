@@ -48,7 +48,12 @@
 #   SSH_KEYS     öffentlicher Schlüssel oder gh:<GitHub-Name>
 #   GIT_NAME, GIT_EMAIL  Git-Identität (nur mit home-manager)
 #   EXTRA_USERS  weitere Benutzer, durch Leerzeichen getrennt
-#   NIX_HOSTNAME, NIX_USER, SWAP_GB
+#   NIX_HOSTNAME Name, auto (pc-<Seriennummer oder MAC>) oder <präfix>-auto, z. B. raum12-auto
+#   NIX_USER, SWAP_GB
+#   KERNEL       latest | lts | xanmod | xanmod_latest | zen
+#   DNS_TLS      none | quad9 | cloudflare | custom (DNS_TLS_SERVERS="IP#Name …")
+#   CACHE_URL, CACHE_KEY  Binär-Cache im eigenen Netz (URL und öffentlicher Schlüssel), sonst nur bei erweiterten Optionen
+#   CHARGE_MAX   Ladegrenze in Prozent bei CHARGE_LIMIT=j (Standard 80)
 #   Ja/Nein (j/n): PRINTING BLUETOOTH LIBVIRT FLATPAK UNFREE ENCRYPT UKI TPM2 SILENT
 #                  SNAPPER BACKUP HIBERNATE AUTOUPDATE OHMYZSH SSHD NV_OPEN FINGERPRINT
 #                  FIDO2_LUKS FIDO2_SUDO RESCUE HOME_MANAGER FAIL2BAN WIFI_COPY ADVANCED
@@ -58,10 +63,11 @@
 #                  EMU_GBA EMU_N64 EMU_XBOX EMU_DC
 #                  SOFTWARE (weitere Programme, nur mit Desktop), Kategorien SW_MEDIA SW_OFFICE SW_WEB
 #                  SW_CHAT SW_GRAPHICS SW_PRINT SW_DEV SW_TOOLS, Programme APP_* (Liste: SW_APPS weiter unten)
+#                  TUNING (scx_lavd, zram-Tuning, BBR) ANANICY (bei Gaming) CHARGE_LIMIT WOL (ohne Desktop)
+#                  Druckertreiber PRN_HP PRN_BROTHER PRN_EPSON PRN_GUTENPRINT PRN_FOO2ZJS PRN_SPLIX
 #                  DISK_FORCE, DISK2_FORCE (trotz SMART-Warnung installieren)
 # Ohne Abfrage, nur per Variable: ESP_GB (Größe von /boot in GiB, 1), COMPRESS (zstd), ZRAM (j),
 #   BOOT_MODE (uefi | bios; Standard: wie der USB-Stick gestartet wurde),
-#   KERNEL (latest = neuester stabiler Kernel | lts = Standard-Kernel des Releases),
 #   TUI (j = Menüs mit dialog, n = reine Textabfragen),
 #   DB_MIN_GB (Dual-Boot: mindestens so viel freier Platz in GiB, 20),
 #   GEOIP (j = Tastatur, Sprache und Zeitzone nach Standort vorschlagen, n = aus),
@@ -810,11 +816,12 @@ ANSWER_VARS=(CHANNEL KB LOCALE TIMEZONE DESKTOP DESKTOP_MODE GPU NV_OPEN KERNEL 
   SWAP_GB ZRAM ESP_GB COMPRESS FINGERPRINT FIDO2_LUKS FIDO2_SUDO RESCUE HOME_MANAGER GIT_NAME
   GIT_EMAIL FAIL2BAN SB_ENROLL SSH_UNLOCK NET_MODE NET_IF NET_ADDR NET_GW NET_DNS NET_ADDR6 NET_GW6 VPN
   GAMING RETROARCH EMU_PS2 EMU_PS3 EMU_PSP EMU_GCWII EMU_WIIU EMU_SWITCH EMU_3DS EMU_NDS EMU_GBA
-  EMU_N64 EMU_XBOX EMU_DC)
+  EMU_N64 EMU_XBOX EMU_DC ANANICY TUNING PRN_HP PRN_BROTHER PRN_EPSON PRN_GUTENPRINT PRN_FOO2ZJS PRN_SPLIX
+  CHARGE_LIMIT CHARGE_MAX DNS_TLS DNS_TLS_SERVERS WOL CACHE_URL CACHE_KEY)
 # Gaming-Auswahl: Variable|Kurzname für die Zusammenfassung
 GAME_ITEMS=(STEAM\|Steam RETROARCH\|RetroArch EMU_PS2\|PS2 EMU_PS3\|PS3 EMU_PSP\|PSP EMU_GCWII\|GameCube/Wii
   EMU_WIIU\|"Wii U" EMU_SWITCH\|Switch EMU_3DS\|3DS EMU_NDS\|DS EMU_GBA\|"GB/GBC/GBA" EMU_N64\|N64
-  EMU_XBOX\|Xbox EMU_DC\|Dreamcast)
+  EMU_XBOX\|Xbox EMU_DC\|Dreamcast ANANICY\|ananicy-cpp)
 
 # Weitere Programme (nur mit Desktop): erst Kategorien, dann Programme je Kategorie
 SW_CATS=(
@@ -961,6 +968,7 @@ save_answers() {
     echo "# Hostname, Grafik (GPU), Swap-Größe und feste IP für einen anderen Rechner ggf. anpassen."
     for k in "${ANSWER_VARS[@]}"; do
       v=${!k-}
+      if [[ $k == NIX_HOSTNAME ]]; then v=${HOSTNAME_TPL:-$v}; fi   # "auto" bleibt "auto"
       if [[ -z $v ]]; then continue; fi
       if [[ $v == none && $k =~ ^(GPU|DESKTOP_MODE|LID)$ ]]; then continue; fi
       if [[ $k == SWAP_GB && $DISK2_MODE == raid1 ]]; then continue; fi   # bei RAID1 erzwungen 0
@@ -969,6 +977,37 @@ save_answers() {
     done
   } > "$f"
   chmod 600 "$f"
+}
+
+# Hostname aus Seriennummer, sonst aus der MAC-Adresse; $1 = "auto" (-> pc-…) oder "<präfix>-auto"
+auto_hostname() {
+  local prefix=pc id="" f n
+  if [[ $1 != auto ]]; then prefix=${1%-auto}; fi
+  for f in product_serial board_serial chassis_serial; do
+    id=$(tr '[:upper:]' '[:lower:]' < "$DMI_DIR/$f" 2>/dev/null | tr -cd 'a-z0-9' || true)
+    case $id in
+      tobefilledbyoem|defaultstring|systemserialnumber|chassisserialnumber|serialnumber|notspecified| \
+      notapplicable|none|oem|na|123456789|0123456789) id="" ;;
+    esac
+    if (( ${#id} >= 4 )) && [[ ! $id =~ ^(.)\1+$ ]]; then break; fi
+    id=""
+  done
+  if [[ -z $id ]]; then   # erste Netzwerkkarte, kabelgebundene bevorzugt
+    for n in /sys/class/net/*/device; do
+      n=${n%/device}
+      if [[ -r $n/address && ! -d $n/wireless ]]; then id=$(tr -d ':' < "$n/address"); break; fi
+    done
+    if [[ -z $id ]]; then
+      for n in /sys/class/net/*/device; do
+        if [[ -r ${n%/device}/address ]]; then id=$(tr -d ':' < "${n%/device}/address"); break; fi
+      done
+    fi
+    id=${id: -6}
+  fi
+  [[ -n $id ]] || return 1
+  n="$prefix-$id"
+  n=${n:0:63}
+  echo "${n%-}"
 }
 
 # "DISK=/dev/nvme0n1 sudo bash i.sh": sudo verwirft die Variablen vor dem Befehl. Sie stehen aber noch in
@@ -1083,7 +1122,12 @@ if (( WINDOWS )); then
 fi
 
 KERNEL_NIX="  boot.kernelPackages = pkgs.$KERNEL_ATTR;"
-if [[ $KERNEL == latest ]]; then KERNEL_NIX+="  # neuester stabiler Kernel"; fi
+case $KERNEL in
+  latest)        KERNEL_NIX+="  # neuester stabiler Kernel" ;;
+  xanmod)        KERNEL_NIX+="  # XanMod auf LTS-Basis" ;;
+  xanmod_latest) KERNEL_NIX+="  # XanMod, aktuelle Version" ;;
+  zen)           KERNEL_NIX+="  # Zen-Kernel" ;;
+esac
 KPARAMS=()
 if (( SILENT )); then KPARAMS+=(quiet rd.systemd.show_status=auto rd.udev.log_level=3 udev.log_level=3); fi
 if (( HIBERNATE )); then KPARAMS+=("resume_offset=$RESUME_OFFSET"); fi
@@ -1091,6 +1135,36 @@ if (( ${#KPARAMS[@]} > 0 )); then
   KERNEL_NIX+=$'\n  boot.kernelParams = ['
   for kp in "${KPARAMS[@]}"; do KERNEL_NIX+=$'\n    "'"$kp"'"'; done
   KERNEL_NIX+=$'\n  ];'
+fi
+
+TUNING_NIX=""
+SYSCTL=()
+if (( TUNING )); then
+  if [[ $DESKTOP != none ]]; then
+    TUNING_NIX='  # sched-ext: Scheduler als BPF-Programm, scx_lavd hält den Desktop unter Last flüssig
+  # (Valve nutzt ihn auf dem Steam Deck); stürzt er ab, übernimmt der normale Scheduler
+  services.scx = {
+    enable = true;
+    scheduler = "scx_lavd";
+  };'
+  fi
+  if (( ZRAM )); then
+    SYSCTL+=('"vm.swappiness" = 180;              # zram ist schnell: früher auslagern statt Cache verwerfen'
+             '"vm.page-cluster" = 0;              # zram liest einzelne Seiten, kein Vorauslesen'
+             '"vm.watermark_boost_factor" = 0;'
+             '"vm.watermark_scale_factor" = 125;  # früher Speicher freimachen, weniger Hänger bei vollem RAM')
+  fi
+  SYSCTL+=('"net.core.default_qdisc" = "fq";'
+           '"net.ipv4.tcp_congestion_control" = "bbr";  # schneller bei WLAN und Uploads')
+fi
+if (( GAMING )); then
+  SYSCTL+=('"kernel.split_lock_mitigate" = 0;  # sonst ruckeln manche Spiele (wie bei SteamOS)')
+fi
+if (( ${#SYSCTL[@]} > 0 )); then
+  TUNING_NIX+="${TUNING_NIX:+$'\n'}  boot.kernel.sysctl = {"
+  for sc in "${SYSCTL[@]}"; do TUNING_NIX+=$'\n    '"$sc"; done
+  TUNING_NIX+=$'\n  };'
+  if (( TUNING )); then TUNING_NIX+=$'\n  boot.kernelModules = [ "tcp_bbr" ];'; fi
 fi
 
 SILENT_NIX=""
@@ -1224,8 +1298,9 @@ if [[ $NET_MODE == static ]]; then
   net_body="
     matchConfig.Name = \"$NET_IF\";
     address = [ $addrs ];
-    routes = [ $routes ];
-    dns = [$dns ];"
+    routes = [ $routes ];"
+  if [[ -n $dns ]]; then net_body+="
+    dns = [$dns ];"; fi
   if [[ -z $NET_ADDR6 ]]; then
     net_body+="
     networkConfig.IPv6AcceptRA = true;  # IPv6 automatisch (SLAAC), wenn im Netz vorhanden"
@@ -1242,6 +1317,50 @@ if [[ $NET_MODE == static ]]; then
 else
   NET_NIX+="
   networking.networkmanager.enable = true;"
+fi
+
+if [[ -n $DNS_TLS_SERVERS ]]; then
+  dns=""
+  for ns in $DNS_TLS_SERVERS; do dns+=$'\n        "'"$ns"'"'; done
+  NET_NIX+="
+  # DNS über TLS mit systemd-resolved; DNS-Server aus dem Netz werden nicht verwendet
+  services.resolved = {
+    enable = true;
+    settings.Resolve = {
+      DNS = [$dns
+      ];
+      DNSOverTLS = true;
+      Domains = [ \"~.\" ];   # alle Anfragen über diese Server
+      FallbackDNS = [ ];      # nie unverschlüsselt ausweichen
+    };
+  };"
+  if [[ $NET_MODE != static ]]; then
+    NET_NIX+="
+  networking.networkmanager.dns = lib.mkForce \"none\";  # DNS vom Router nicht an resolved weitergeben"
+  fi
+fi
+if (( WOL )); then
+  NET_NIX+=$'\n'"$(cat <<'NIX'
+  # Wake-on-LAN (Magic Packet) für alle Netzwerkkarten mit Kabel, bei jedem Start
+  systemd.services.wake-on-lan = {
+    wantedBy = [ "multi-user.target" ];
+    after = [ "network.target" ];
+    path = [ pkgs.ethtool ];
+    serviceConfig.Type = "oneshot";
+    script = ''
+      for n in /sys/class/net/*; do
+        if [ -e "$n/device" ] && [ ! -d "$n/wireless" ]; then ethtool -s "''${n##*/}" wol g || true; fi
+      done
+    '';
+  };
+NIX
+)"
+fi
+if [[ -n $CACHE_URL ]]; then
+  NET_NIX+="
+  # Binär-Cache im eigenen Netz, vor cache.nixos.org
+  nix.settings.substituters = [ \"$CACHE_URL\" ];
+  nix.settings.trusted-public-keys = [ \"$CACHE_KEY\" ];"
 fi
 
 UNLOCK_NIX=""
@@ -1427,6 +1546,14 @@ fi
 EXTRAS_NIX=""
 if (( PRINTING )); then
   EXTRAS_NIX+='  services.printing.enable = true;'
+  drv=""
+  if (( PRN_HP ));         then drv+=$'\n    hplip'; fi
+  if (( PRN_BROTHER ));    then drv+=$'\n    brlaser'; fi
+  if (( PRN_EPSON ));      then drv+=$'\n    epson-escpr\n    epson-escpr2'; fi
+  if (( PRN_GUTENPRINT )); then drv+=$'\n    gutenprint'; fi
+  if (( PRN_FOO2ZJS ));    then drv+=$'\n    foo2zjs'; fi
+  if (( PRN_SPLIX ));      then drv+=$'\n    splix'; fi
+  if [[ -n $drv ]]; then EXTRAS_NIX+=$'\n  services.printing.drivers = with pkgs; ['"$drv"$'\n  ];'; fi
 fi
 if [[ $DESKTOP != none ]]; then
   if [[ -n $EXTRAS_NIX ]]; then EXTRAS_NIX+=$'\n'; fi
@@ -1461,6 +1588,14 @@ if (( GAMING )); then
   if (( STEAM )); then
     GAMING_NIX+='
   programs.steam.enable = true;     # in Steam: Startoptionen "gamemoderun %command%"'
+  fi
+  if (( ANANICY )); then
+    GAMING_NIX+='
+  services.ananicy = {              # Spiele, Audio und Desktop bekommen Vorrang vor Hintergrundarbeit
+    enable = true;
+    package = pkgs.ananicy-cpp;
+    rulesProvider = pkgs.ananicy-rules-cachyos;
+  };'
   fi
   if (( RETROARCH )); then
     GAMING_PKGS+='
@@ -1859,6 +1994,12 @@ if (( LAPTOP )); then
   services.logind.settings.Login.HandleLidSwitch = "ignore";' ;;
   esac
 fi
+if (( CHARGE_LIMIT )); then
+  POWER_NIX+="${POWER_NIX:+$'\n'}  # Akku nur bis $CHARGE_MAX % laden (Startschwelle zuerst, manche Geräte verlangen Start < Ende)
+  services.udev.extraRules = ''
+    SUBSYSTEM==\"power_supply\", KERNEL==\"BAT*\", ATTR{charge_control_start_threshold}=\"$(( CHARGE_MAX - 5 ))\", ATTR{charge_control_end_threshold}=\"$CHARGE_MAX\"
+  '';"
+fi
 
 # Festplatten überwachen (nicht in VMs, dort gibt es keine SMART-Werte)
 SMARTD_NIX=""
@@ -2044,6 +2185,7 @@ PKG_NIX+='
   emit "Bootloader"                         "$BOOT_NIX"
   emit "Kernel"                             "$KERNEL_NIX"
   emit "Silent Boot"                        "$SILENT_NIX"
+  emit "Leistungs-Optimierungen"            "$TUNING_NIX"
   emit "Laptop: Energie und Deckel"          "$POWER_NIX"
   emit "Verschlüsselung"                     "$LUKS_NIX"
   emit "Entsperren beim Start (SSH, TPM2)"   "$UNLOCK_NIX"
@@ -2084,6 +2226,10 @@ PKG_NIX+='
   printf '}\n'
 } > "$CFG"
 }
+
+# Für Tests (tests/eval.sh): "INSTALLER_LIB=1 source install.sh" lädt nur die Funktionen
+# shellcheck disable=SC2317  # exit nur, wenn nicht per source geladen
+if [[ ${INSTALLER_LIB-} == 1 ]]; then return 0 2>/dev/null || exit 0; fi
 
 # ---------- Vorabprüfungen ----------
 [[ $EUID -eq 0 ]] || die "Bitte als root ausführen (sudo -i)."
@@ -2149,8 +2295,6 @@ done
 
 : "${ESP_GB:=1}"
 : "${COMPRESS:=zstd}"
-KERNEL_PRESET=${KERNEL:-}   # per Variable gesetzt? Dann bei NVIDIA nicht nachfragen
-: "${KERNEL:=latest}"
 : "${ZRAM:=j}"
 if is_yes "$ZRAM"; then ZRAM=1; else ZRAM=0; fi
 [[ $ESP_GB =~ ^[0-9]+$ ]] && (( ESP_GB >= 1 )) || die "ESP_GB muss mindestens 1 sein."
@@ -2442,14 +2586,26 @@ if [[ $GPU == nvidia* ]]; then
   # Offene Kernelmodule gibt es ab Turing (GTX 16xx/RTX 20xx), PCI-Gerätenummer ab 0x1e00
   if [[ -n $NV_ID ]] && (( NV_ID >= 0x1e00 )); then odef=j; else odef=n; fi
   ask_yn NV_OPEN "Offene NVIDIA-Kernelmodule? (ab GTX 16xx/RTX 20xx ja; GTX 9xx/10xx nein, dann Treiber 580)" "$odef"
-  if [[ -z $KERNEL_PRESET ]]; then
-    ask_yn NV_LTS "Mit NVIDIA den LTS-Kernel nehmen? (proprietäre Treiber hinken neuen Kerneln oft hinterher)" j
-    if (( NV_LTS )); then KERNEL=lts; fi
-  fi
   if [[ $GPU == nvidia-prime && ( -z $NV_DEV || -z $IGPU_DEV ) ]]; then
     note "Für PRIME wurden nicht beide GPUs gefunden, nehme den normalen NVIDIA-Treiber."
     GPU=nvidia
   fi
+fi
+
+# ---------- Kernel und Optimierungen ----------
+# NVIDIA: proprietäre Treiber hinken neuen Kerneln oft hinterher, daher dort LTS als Vorschlag
+if [[ $GPU == nvidia* ]]; then kdef=2; else kdef=1; fi
+choose KERNEL "Welcher Kernel?" "$kdef" \
+  "latest|Neuester stabiler Kernel$(if [[ $GPU != nvidia* ]]; then echo " (empfohlen)"; fi)" \
+  "lts|LTS-Kernel des Releases (am längsten gepflegt$(if [[ $GPU == nvidia* ]]; then echo ", empfohlen mit NVIDIA"; fi))" \
+  "xanmod|XanMod LTS (für Desktop und Spiele optimiert, auf LTS-Basis)" \
+  "xanmod_latest|XanMod aktuell" \
+  "zen|Zen (für Desktop und Spiele optimiert, aktuell)"
+case $KERNEL in latest|lts|xanmod|xanmod_latest|zen) ;; *) die "KERNEL muss latest, lts, xanmod, xanmod_latest oder zen sein." ;; esac
+if [[ $DESKTOP != none ]]; then
+  ask_yn TUNING "Leistungs-Optimierungen? (sched-ext-Scheduler scx_lavd für flüssigeren Desktop, zram-Tuning, TCP BBR)" j
+else
+  ask_yn TUNING "Leistungs-Optimierungen? (zram-Tuning, TCP BBR)" j
 fi
 
 # ---------- Hardware-Profil (nixos-hardware) ----------
@@ -2510,6 +2666,22 @@ else
   PRINTING=0; BLUETOOTH=0
   FLATPAK=0   # Flatpak braucht XDG-Portale, die erst ein Desktop mitbringt
 fi
+if (( PRINTING )); then
+  ask_multi "Druckertreiber (neuere Netzwerkdrucker brauchen keinen)" \
+    PRN_HP        "HP (hplip)" n \
+    PRN_BROTHER   "Brother Laser (brlaser)" n \
+    PRN_EPSON     "Epson Tinte (epson-escpr, epson-escpr2)" n \
+    PRN_GUTENPRINT "Gutenprint (viele ältere Tintenstrahl- und Fotodrucker)" n \
+    PRN_FOO2ZJS   "HP LaserJet, Minolta, Samsung, Xerox ohne eigene Sprache (foo2zjs)" n \
+    PRN_SPLIX     "Samsung und Xerox mit SPL (splix)" n
+else
+  PRN_HP=0; PRN_BROTHER=0; PRN_EPSON=0; PRN_GUTENPRINT=0; PRN_FOO2ZJS=0; PRN_SPLIX=0
+fi
+PRN_NAMES=""
+for it in PRN_HP:HP PRN_BROTHER:Brother PRN_EPSON:Epson PRN_GUTENPRINT:Gutenprint PRN_FOO2ZJS:foo2zjs PRN_SPLIX:splix; do
+  v=${it%%:*}
+  if [[ ${!v} == 1 ]]; then PRN_NAMES+="${PRN_NAMES:+, }${it#*:}"; fi
+done
 
 # ---------- Gaming ----------
 # Ältere Antwortdateien kennen nur STEAM=j, ohne GAMING
@@ -2539,7 +2711,8 @@ if (( GAMING )); then
     EMU_GBA    "Game Boy / Color / Advance (mGBA)" n
     EMU_N64    "Nintendo 64 (RMG)" n
     EMU_XBOX   "Xbox Classic (xemu)" n
-    EMU_DC     "Dreamcast (Flycast)" n)
+    EMU_DC     "Dreamcast (Flycast)" n
+    ANANICY    "Prozess-Prioritäten automatisch anpassen (ananicy-cpp mit CachyOS-Regeln)" n)
   ask_multi "Gaming: Steam, RetroArch und Emulatoren" "${game_opts[@]}"
 fi
 # Nicht angeboten oder nicht gewählt = aus (ask_multi hat Gewähltes auf 1 gesetzt)
@@ -2721,6 +2894,20 @@ else
   if is_yes "${HIBERNATE:-n}"; then HIBERNATE=1; else HIBERNATE=0; fi
   LID=none
 fi
+# Ladegrenze nur, wenn der Akku sie unterstützt (z. B. ThinkPad, viele ASUS, Dell, Framework)
+CHARGE_OK=0
+for b in /sys/class/power_supply/BAT*; do
+  if [[ -w $b/charge_control_end_threshold ]]; then CHARGE_OK=1; fi
+done
+if (( LAPTOP && CHARGE_OK )); then
+  ask_yn CHARGE_LIMIT "Akku nur teilweise laden? (schont ihn bei Geräten, die meist am Netz hängen)" n
+  if (( CHARGE_LIMIT )); then
+    ask CHARGE_MAX "Bis wie viel Prozent laden?" 80 '^(5[0-9]|[6-9][0-9]|100)$' "Bitte 50 bis 100"
+  fi
+else
+  CHARGE_LIMIT=0
+fi
+CHARGE_MAX=${CHARGE_MAX:-80}
 
 choose LOGIN_SHELL "Welche Shell für den Benutzer?" 1 \
   "bash|Bash" \
@@ -2763,6 +2950,19 @@ else
   NET_MODE=${NET_MODE:-dhcp}
 fi
 case $NET_MODE in dhcp|static) ;; *) die "NET_MODE muss dhcp oder static sein." ;; esac
+choose DNS_TLS "DNS verschlüsselt abfragen (DNS über TLS)? Geht nicht in Netzen, die Port 853 sperren" 1 \
+  "none|Nein, DNS vom Router bzw. aus dem Netz" \
+  "quad9|Quad9 (Schweiz, blockiert bekannte Schadseiten)" \
+  "cloudflare|Cloudflare (1.1.1.1)" \
+  "custom|Eigener Server"
+case $DNS_TLS in
+  none) DNS_TLS_SERVERS="" ;;
+  quad9) DNS_TLS_SERVERS="9.9.9.9#dns.quad9.net 149.112.112.112#dns.quad9.net 2620:fe::fe#dns.quad9.net 2620:fe::9#dns.quad9.net" ;;
+  cloudflare) DNS_TLS_SERVERS="1.1.1.1#cloudflare-dns.com 1.0.0.1#cloudflare-dns.com 2606:4700:4700::1111#cloudflare-dns.com 2606:4700:4700::1001#cloudflare-dns.com" ;;
+  custom) ask DNS_TLS_SERVERS "Server als IP#Name, durch Leerzeichen getrennt, z. B. 10.0.0.53#dns.schule.lan" "" \
+            '^([0-9a-fA-F:.]+#[A-Za-z0-9.-]+ ?)+$' "Form: IP#Name, z. B. 10.0.0.53#dns.schule.lan" ;;
+  *) die "DNS_TLS muss none, quad9, cloudflare oder custom sein." ;;
+esac
 if [[ $NET_MODE == static ]]; then
   if [[ -z ${NET_IF-} ]]; then
     NET_IFS=()
@@ -2782,7 +2982,11 @@ if [[ $NET_MODE == static ]]; then
   ask NET_ADDR "IPv4-Adresse mit Präfix, z. B. 192.168.1.10/24" "$cur_addr" \
     '^([0-9]{1,3}\.){3}[0-9]{1,3}/[0-9]{1,2}$' "Form: 192.168.1.10/24"
   ask NET_GW "Gateway (Router)" "$cur_gw" '^([0-9]{1,3}\.){3}[0-9]{1,3}$' "Form: 192.168.1.1"
-  ask NET_DNS "DNS-Server, durch Leerzeichen getrennt" "${cur_dns% }" '^[0-9a-fA-F:. ]+$' "Nur IP-Adressen, z. B. 192.168.1.1 9.9.9.9"
+  if [[ $DNS_TLS == none ]]; then
+    ask NET_DNS "DNS-Server, durch Leerzeichen getrennt" "${cur_dns% }" '^[0-9a-fA-F:. ]+$' "Nur IP-Adressen, z. B. 192.168.1.1 9.9.9.9"
+  else
+    NET_DNS=""   # verschlüsseltes DNS ersetzt die DNS-Server aus dem Netz
+  fi
   ask NET_ADDR6 "IPv6-Adresse mit Präfix (leer = automatisch per SLAAC)" "" '^([0-9a-fA-F:]+/[0-9]{1,3})?$' "Form: 2001:db8::10/64"
   if [[ -n $NET_ADDR6 ]]; then
     ask NET_GW6 "IPv6-Gateway (leer = keins)" "" '^([0-9a-fA-F:]+)?$' "Form: fe80::1 oder 2001:db8::1"
@@ -2791,6 +2995,31 @@ if [[ $NET_MODE == static ]]; then
   fi
 else
   NET_IF=${NET_IF-}; NET_ADDR=${NET_ADDR-}; NET_GW=${NET_GW-}; NET_DNS=${NET_DNS-}; NET_ADDR6=${NET_ADDR6-}; NET_GW6=${NET_GW6-}
+fi
+
+# Wake-on-LAN (nur ohne Desktop, z. B. Server und Rechner im Schrank)
+if [[ $DESKTOP == none ]]; then
+  ask_yn WOL "Wake-on-LAN für die Netzwerkkarten mit Kabel? (Einschalten per Netzwerk, im BIOS ggf. auch erlauben)" j
+else
+  WOL=0
+fi
+
+# Binär-Cache im eigenen Netz (z. B. harmonia, Attic, ncps): spart Download bei vielen Rechnern
+if (( ADVANCED )) || [[ -n ${CACHE_URL-} ]]; then
+  ask CACHE_URL "Binär-Cache im eigenen Netz (leer = keiner), z. B. http://cache.schule.lan:5000" "" \
+    '^(https?://[A-Za-z0-9._:-]+(/[A-Za-z0-9._~/-]*)?)?$' "Form: http://server:5000 oder https://cache.example.org"
+  CACHE_URL=${CACHE_URL%/}
+  if [[ -n $CACHE_URL ]]; then
+    ask CACHE_KEY "Öffentlicher Schlüssel des Caches (name:basis64…)" "" \
+      '^[A-Za-z0-9._-]+:[A-Za-z0-9+/]{43}=$' "Form: cache.schule.lan-1:…= (aus dem Cache-Server)"
+    if ! curl -fsS --max-time 8 "$CACHE_URL/nix-cache-info" 2>/dev/null | grep -q '^StoreDir:'; then
+      note "Der Cache $CACHE_URL antwortet nicht. Er wird trotzdem eingetragen; ohne ihn lädt Nix von cache.nixos.org."
+    fi
+  else
+    CACHE_KEY=""
+  fi
+else
+  CACHE_URL=""; CACHE_KEY=""
 fi
 
 # ---------- VPN ----------
@@ -2853,7 +3082,14 @@ fi
 
 # ---------- Weitere Angaben ----------
 echo
-ask NIX_HOSTNAME "Hostname" "nixos" '^[a-zA-Z0-9][a-zA-Z0-9-]{0,62}$' "Ungültiger Hostname (Buchstaben, Ziffern, -)"
+ask NIX_HOSTNAME "Hostname (auto = aus Seriennummer bzw. MAC, raum12-auto = mit eigenem Anfang)" "nixos" \
+  '^[a-zA-Z0-9][a-zA-Z0-9-]{0,62}$' "Ungültiger Hostname (Buchstaben, Ziffern, -)"
+HOSTNAME_TPL=""
+if [[ $NIX_HOSTNAME == auto || $NIX_HOSTNAME == *-auto ]]; then
+  HOSTNAME_TPL=$NIX_HOSTNAME
+  NIX_HOSTNAME=$(auto_hostname "$HOSTNAME_TPL") || die "Hostname $HOSTNAME_TPL: weder Seriennummer noch Netzwerkkarte gefunden."
+  echo "  Hostname: $NIX_HOSTNAME (aus $HOSTNAME_TPL)"
+fi
 [[ $NIX_HOSTNAME =~ ^[a-zA-Z0-9][a-zA-Z0-9-]{0,62}$ ]] || die "Ungültiger Hostname."
 
 ask NIX_USER "Benutzername" "" '^[a-z_][a-z0-9_-]{0,31}$' "Ungültiger Benutzername (klein, a-z 0-9 _ -)"
@@ -2898,7 +3134,7 @@ done
 case $KERNEL in
   latest) KERNEL_ATTR=linuxPackages_latest ;;
   lts)    KERNEL_ATTR=linuxPackages ;;
-  *)      die "KERNEL muss latest oder lts sein." ;;
+  *)      KERNEL_ATTR=linuxPackages_$KERNEL ;;   # xanmod, xanmod_latest, zen
 esac
 
 if (( AUTO_MODE )); then
@@ -2995,7 +3231,7 @@ $(case $DISK2_MODE in
   esac)
   Version:        $CHANNEL_NAME
   Bootloader:     $( if [[ $BOOT_MODE == bios ]]; then echo "GRUB, Legacy-BIOS ($GRUB_DEV)"; elif (( UKI && SB_ENROLL )); then echo "UKI via lanzaboote, Secure-Boot-Schlüssel werden in die Firmware eingetragen"; elif (( UKI )); then echo "UKI via lanzaboote (Secure-Boot-Schlüssel werden erzeugt)"; else echo "systemd-boot (UEFI)"; fi )
-  Kernel:         $(if [[ $KERNEL == latest ]]; then echo "neuester stabiler (linuxPackages_latest)"; else echo "Standard des Releases (linuxPackages)"; fi)
+  Kernel:         $(case $KERNEL in latest) echo "neuester stabiler" ;; lts) echo "LTS des Releases" ;; xanmod) echo "XanMod LTS" ;; xanmod_latest) echo "XanMod aktuell" ;; zen) echo Zen ;; esac) ($KERNEL_ATTR)$(if (( TUNING )); then echo ", Optimierungen: $(if [[ $DESKTOP != none ]]; then echo "scx_lavd, "; fi)$(if (( ZRAM )); then echo "zram, "; fi)BBR"; fi)
   Silent Boot:    $(yn "$SILENT")$(if (( SILENT )); then echo " (Plymouth)"; fi)
   Tastatur:       $XKB_LAYOUT${XKB_VARIANT:+ ($XKB_VARIANT)}
   Sprache:        $LANG_LOCALE${FORMAT_LOCALE:+, Formate $FORMAT_LOCALE}
@@ -3004,7 +3240,7 @@ $(case $DISK2_MODE in
   Grafik:         $GPU$(if [[ $GPU == nvidia* ]]; then echo " (offene Module: $(yn "$NV_OPEN"))"; fi)
   HW-Profil:      $(if [[ $HW_PROFILE != none ]]; then echo "nixos-hardware $HW_PROFILE"; else echo keins; fi)
   Fingerabdruck:  $(yn "$FINGERPRINT")
-  Extras:         Drucken $(yn "$PRINTING"), Bluetooth $(yn "$BLUETOOTH")
+  Extras:         Drucken $(yn "$PRINTING")${PRN_NAMES:+ (Treiber: $PRN_NAMES)}, Bluetooth $(yn "$BLUETOOTH")$(if (( CHARGE_LIMIT )); then echo ", Akku bis $CHARGE_MAX %"; fi)
   Gaming:         $(if (( GAMING )); then echo "${GAME_SUMMARY:-nur Gamemode und Controller}"; else echo nein; fi)
   Programme:      $(if [[ -n $SW_SUMMARY ]]; then echo "zusätzlich:$SW_SUMMARY"; else echo "keine zusätzlichen"; fi)
   Samba:          $(case $SAMBA in none) echo nein ;; client) echo "Client (Netzlaufwerke nutzen)" ;; server) echo "Client + Freigabe ~/Freigabe" ;; esac)
@@ -3024,11 +3260,13 @@ $(case $DISK2_MODE in
   Aufräumen:      wöchentlich (nh clean, letzte 10 Generationen bleiben)
   Shell:          $LOGIN_SHELL$(if [[ $LOGIN_SHELL == zsh ]]; then echo " (oh-my-zsh: $(yn "$OHMYZSH"))"; fi)
   home-manager:   $(if (( HOME_MANAGER )); then echo "ja, /etc/nixos/home.nix${GIT_NAME:+, Git: $GIT_NAME}${GIT_EMAIL:+ <$GIT_EMAIL>}"; else echo nein; fi)
-  Hostname:       $NIX_HOSTNAME
+  Hostname:       $NIX_HOSTNAME${HOSTNAME_TPL:+ (aus $HOSTNAME_TPL)}
   Benutzer:       $NIX_USER (Admin)${EXTRA_USERS:+, $EXTRA_USERS}
   Swap:           ${SWAP_GB} GiB Swapfile$(if (( ZRAM )); then echo " + zram"; fi)
   SSH:            $(yn "$SSHD")$(if (( SSHD )); then if [[ -n $SSH_KEYS_NIX ]]; then echo " ($(grep -c . <<<"$SSH_KEYS_NIX") Schlüssel)"; else echo " (noch ohne Schlüssel)"; fi; fi)$(if (( FAIL2BAN )); then echo ", fail2ban"; fi)
   Netzwerk:       $(if [[ $NET_MODE == static ]]; then echo "fest: $NET_IF $NET_ADDR, Gateway $NET_GW, DNS $NET_DNS${NET_ADDR6:+, $NET_ADDR6}"; else echo "automatisch (NetworkManager)$(if (( WIFI_COPY )); then echo ", WLAN wird übernommen"; fi)"; fi)${LIVE_PROXY:+, Proxy $LIVE_PROXY}
+  DNS:            $(case $DNS_TLS in none) echo "aus dem Netz" ;; custom) echo "über TLS: $DNS_TLS_SERVERS" ;; *) echo "über TLS ($DNS_TLS)" ;; esac)$(if (( WOL )); then echo ", Wake-on-LAN an"; fi)
+  Binär-Cache:    ${CACHE_URL:-nur cache.nixos.org}
   VPN:            ${VPN_SUMMARY:-nein}
 EOF
 )
@@ -3336,7 +3574,11 @@ else
 fi
 # Alle Kanäle (nixos, ggf. home-manager und nixos-hardware) ins neue System übernehmen
 CHANNELS_PATH=$(readlink -f /nix/var/nix/profiles/per-user/root/channels)
-while ! nixos-install --no-root-passwd --channel "$CHANNELS_PATH"; do
+INSTALL_OPTS=()
+if [[ -n $CACHE_URL ]]; then
+  INSTALL_OPTS=(--option extra-substituters "$CACHE_URL" --option extra-trusted-public-keys "$CACHE_KEY")
+fi
+while ! nixos-install --no-root-passwd --channel "$CHANNELS_PATH" "${INSTALL_OPTS[@]}"; do
   warn "nixos-install ist fehlgeschlagen. Die Ursache steht oben und im Protokoll."
   if (( AUTO_MODE )); then die "Automatikmodus: Installation fehlgeschlagen. Konfiguration: $CFG, eingehängt unter /mnt."; fi
   unset RETRY

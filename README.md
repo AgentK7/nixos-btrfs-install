@@ -1,5 +1,7 @@
 # nixos-btrfs-install
 
+[![Prüfung](https://github.com/AgentK7/nixos-btrfs-install/actions/workflows/pruefung.yml/badge.svg)](https://github.com/AgentK7/nixos-btrfs-install/actions/workflows/pruefung.yml)
+
 Interaktives Installer-Skript für NixOS auf btrfs, wahlweise aktuelles Release oder unstable.
 
 Im NixOS-Live-System als root (UEFI mit ausgeschaltetem Secure Boot oder Legacy-BIOS):
@@ -44,7 +46,16 @@ DISK=/dev/nvme0n1 ANTWORTEN=/pfad/install-antworten.env sudo -E bash i.sh
 ANTWORTEN=https://server/install-antworten.env sudo -E bash i.sh
 ```
 
-Die Datei wird nur gelesen, nicht ausgeführt. Hostname, Grafik, Swap-Größe und feste IP ggf. pro Rechner anpassen.
+Die Datei wird nur gelesen, nicht ausgeführt. Grafik, Swap-Größe und feste IP ggf. pro Rechner anpassen.
+
+**Hostname automatisch:** `NIX_HOSTNAME=auto` ergibt `pc-<Seriennummer>` (ohne brauchbare Seriennummer: die letzten
+6 Stellen der MAC-Adresse), `NIX_HOSTNAME=raum12-auto` ergibt `raum12-<…>`. In der Antwortdatei bleibt `auto` stehen,
+so bekommt jeder Rechner aus derselben Datei einen eigenen Namen.
+
+**Binär-Cache im eigenen Netz:** Mit `CACHE_URL` und `CACHE_KEY` (oder bei den erweiterten Optionen) lädt die Installation
+zuerst aus dem eigenen Cache, das neue System später auch. Eine Vollinstallation sind schnell mehrere GB je Rechner.
+Als Cache eignet sich z. B. ein Proxy-Cache wie [ncps](https://github.com/kalbasit/ncps) oder [Attic](https://github.com/zhaofengli/attic),
+oder [harmonia](https://github.com/nix-community/harmonia) auf einem Rechner, der dieselbe Konfiguration schon gebaut hat.
 
 ### Vollautomatisch
 
@@ -104,6 +115,9 @@ erst die WLAN-Auswahl. Werkzeuge wie `dialog`, `smartctl` und `sbctl` sind schon
   Tailscale lässt sich auch bei den weiteren Programmen ankreuzen (`APP_TAILSCALE`). Mit Desktop kommt eine Oberfläche dazu
   (KTailctl unter Plasma, sonst Trayscale), und der Hauptbenutzer darf Tailscale ohne sudo steuern (`--operator`).
 - **fail2ban** für SSH, wenn SSH eingerichtet wird.
+- **DNS über TLS** (systemd-resolved): Quad9, Cloudflare oder ein eigener Server (`IP#Name`). Die DNS-Server aus dem Netz
+  werden dann nicht verwendet. Geht nicht in Netzen, die Port 853 sperren (manche Schul- und Firmennetze, Hotel-WLAN mit Anmeldeseite).
+- **Wake-on-LAN** (nur ohne Desktop): Magic Packet für alle Netzwerkkarten mit Kabel. Im BIOS muss es ggf. auch erlaubt sein.
 - **Entsperren per SSH:** Verschlüsselte Rechner (Standard bei Servern) lassen sich beim Start über `ssh -p 2222 root@<rechner>`
   entsperren – nach dem Login fragt der Rechner direkt nach dem LUKS-Passwort. Läuft nur über Kabel; der Fingerabdruck des
   eigenen Start-Schlüssels steht am Ende der Installation.
@@ -128,7 +142,7 @@ Vorher im anderen System Platz freigeben (Windows: Datenträgerverwaltung → Vo
 - Rest btrfs, optional in LUKS2
 - Subvolumes `@`, `@home`, `@nix`, `@log`, `@swap` mit `compress=zstd,noatime`, optional snapper-Snapshots für `/home`
 - systemd-boot oder UKI über [lanzaboote](https://github.com/nix-community/lanzaboote) v1.2.0, optional TPM2-Entsperren für LUKS
-- Neuester stabiler Kernel (`KERNEL=lts` für den Standard-Kernel), bei NVIDIA auf Wunsch LTS
+- Kernel zur Wahl (siehe unten), dazu optional Leistungs-Optimierungen
 - Grafik: Intel, AMD, NVIDIA (offene Module oder Treiber 580), NVIDIA-PRIME für Laptops, nouveau
 - Hardware-Profil aus [nixos-hardware](https://github.com/NixOS/nixos-hardware): Modell wird erkannt, passende Profile werden vorgeschlagen
 - Fingerabdruckleser (erkannt über die Geräteliste von libfprint) für sudo, Admin-Abfragen und Sperrbildschirm
@@ -140,7 +154,8 @@ Vorher im anderen System Platz freigeben (Windows: Datenträgerverwaltung → Vo
 - Backup von `/home` mit restic auf einen anderen Rechner (SFTP, REST-Server, S3 …), täglich
 - VMs (libvirt, virt-manager), Container (Podman oder Docker)
 - PipeWire mit ALSA (inkl. 32 bit), PulseAudio und JACK
-- Optional: Drucken, Bluetooth, Samba (Client oder Server), Flatpak + Flathub, SSH nur mit Schlüssel
+- Optional: Drucken (mit Treibern für HP, Brother, Epson, Gutenprint, foo2zjs, splix), Bluetooth, Samba (Client oder Server), Flatpak + Flathub, SSH nur mit Schlüssel
+- Laptops mit unterstützter Ladegrenze (ThinkPad, viele ASUS, Dell, Framework): Akku nur bis z. B. 80 % laden
 - Gaming (nur mit Desktop, siehe unten): Steam, RetroArch und Emulatoren zum Ankreuzen, dazu Gamemode und Controller-Regeln
 - Weitere Programme nach Kategorien (nur mit Desktop, siehe unten)
 - Schriften: Noto mit Emoji und CJK, JetBrains Mono Nerd Font
@@ -148,6 +163,28 @@ Vorher im anderen System Platz freigeben (Windows: Datenträgerverwaltung → Vo
 - Optional [home-manager](https://github.com/nix-community/home-manager): Shell, Aliase und Git-Identität in `/etc/nixos/home.nix`
 - Systempakete: git, nixfmt, vim, btop, ripgrep, fd, bat, jq, tmux, ncdu, nvme-cli, inxi, hyfetch, unrar, dig, nmap, tcpdump, iperf3, nix-tree, nh, direnv u. a.
   (`unrar` ist unfrei, ohne Unfree kommt `unrar-free`)
+
+## Kernel und Leistung
+
+| Auswahl (`KERNEL`) | Paket | Hinweis |
+|---|---|---|
+| `latest` (Standard) | `linuxPackages_latest` | neuester stabiler Kernel |
+| `lts` (Standard mit NVIDIA) | `linuxPackages` | am längsten gepflegt, NVIDIA-Treiber passen sicher |
+| `xanmod` | `linuxPackages_xanmod` | XanMod auf LTS-Basis, für Desktop und Spiele optimiert |
+| `xanmod_latest` | `linuxPackages_xanmod_latest` | XanMod aktuell |
+| `zen` | `linuxPackages_zen` | Zen, für Desktop und Spiele optimiert |
+
+Alle kommen fertig aus dem Binär-Cache. Den CachyOS-Kernel gibt es nicht in nixpkgs (nur über fremde Flakes mit eigenem
+Cache), deshalb fehlt er hier; der wichtigste Teil davon, ein besserer Scheduler, kommt mit den Optimierungen:
+
+**Leistungs-Optimierungen** (`TUNING`, Standard: ja)
+- sched-ext-Scheduler `scx_lavd` (nur mit Desktop): hält den Desktop unter Last flüssig, Valve nutzt ihn auf dem Steam Deck.
+  Läuft als BPF-Programm auf allen Kerneln oben; stürzt er ab, übernimmt der normale Scheduler.
+- zram-Tuning: `vm.swappiness=180`, `page-cluster=0` und Watermark-Werte wie bei Fedora und Pop!_OS
+- TCP BBR mit `fq`: schneller bei WLAN und Uploads
+
+Mit Gaming zusätzlich `kernel.split_lock_mitigate=0` (wie SteamOS) und auf Wunsch ananicy-cpp mit den CachyOS-Regeln.
+Bewusst nicht: `mitigations=off` (Sicherheitslücken für wenig Gewinn) und selbst gebaute Kernel (kein Cache, stundenlanges Bauen).
 
 ## Gaming
 
@@ -231,6 +268,13 @@ Ohne Setup Mode, von Hand nach dem ersten Start:
 Kernel versehentlich signiert? Signatur aus sbctl entfernen (`sudo sbctl remove-file <datei>`),
 `sudo rm /boot/EFI/nixos/kernel-*.efi` und `sudo nixos-rebuild boot` – lzbt installiert den
 Kernel dann im Original neu.
+
+## Prüfung (CI)
+
+Bei jedem Push, jedem Pull-Request und montags baut [`tests/eval.sh`](tests/eval.sh) die `configuration.nix` für
+mehrere Szenarien (`tests/szenarien/`) und wertet sie gegen das aktuelle Release und gegen unstable aus, dazu läuft
+shellcheck. So fallen entfernte oder umbenannte NixOS-Optionen auf, bevor eine Installation daran scheitert.
+Lokal: `tests/eval.sh release` oder `tests/eval.sh unstable server` (braucht Nix, installiert nichts).
 
 ## Nach der Installation
 
