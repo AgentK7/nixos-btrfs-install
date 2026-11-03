@@ -341,14 +341,34 @@ fi
 [[ -f flake.lock ]] && git_do add -- flake.lock
 chown --reference=configuration.nix flake.nix riftlinux.nix flake.lock 2>/dev/null || true
 
-# Treiber gleich für den aufrufenden User bei SteamVR registrieren (sonst beim nächsten Login/Einstecken)
-if [[ -n ${SUDO_USER:-} ]]; then
-    systemctl --user --machine="${SUDO_USER}@" start riftlinux-register.service || true
+# Wie das Original-Paket nach der Installation: udev-Regeln laden und schon eingesteckte Rift-Geräte neu auslösen,
+# sonst bekommen sie die Zugriffsrechte (uaccess) erst nach erneutem Einstecken
+udevadm control --reload-rules 2>/dev/null || true
+udevadm trigger --subsystem-match=usb --attr-match=idVendor=2833 2>/dev/null || true
+udevadm trigger --subsystem-match=hidraw 2>/dev/null || true
+
+# Treiber gleich für den aufrufenden User bei SteamVR registrieren (sonst beim nächsten Login/Einstecken).
+# daemon-reload, damit der laufende User-Manager die neue Unit kennt.
+if [[ -n ${SUDO_USER:-} && $SUDO_USER != root ]]; then
+    if ! { systemctl --user --machine="${SUDO_USER}@.host" daemon-reload &&
+           systemctl --user --machine="${SUDO_USER}@.host" start riftlinux-register.service; } 2>/dev/null; then
+        runuser -u "$SUDO_USER" -- /run/current-system/sw/bin/riftlinux-setup register --quiet || true
+    fi
+fi
+
+# NVIDIA mit VRR-Monitor: Bild im Headset reißt unter Wayland (riftlinux-setup nvidia-vrr conceal geht auf NixOS nicht)
+if [[ -e /proc/driver/nvidia/version ]] &&
+   /run/current-system/sw/bin/riftlinux-setup nvidia-vrr status 2>/dev/null | grep -q "offer(s) adaptive sync"; then
+    echo
+    echo "Hinweis: Ein Monitor bietet VRR an. Unter Wayland reißt das Bild im Headset (NVIDIA-Fehler)."
+    echo "         Abhilfe (Monitore verlieren VRR): in ${NIXOS_DIR}/riftlinux.nix die Zeile"
+    echo "         boot.extraModprobeConfig = … einkommentieren, neu bauen und neu starten."
 fi
 
 echo
-echo "Fertig. Steam einmal neu starten, Rift anstecken (HDMI + USB, Sensoren an USB) und SteamVR starten."
-echo "Prüfen:     riftlinux-setup check"
+echo "Fertig. Steam einmal als dein Benutzer starten und SteamVR installieren (Bibliothek → Tools),"
+echo "dann Rift anstecken (HDMI + USB, Sensoren an USB) und SteamVR starten."
+echo "Prüfen:     riftlinux-setup check   (als normaler Benutzer in der Desktop-Sitzung, ohne sudo)"
 echo "Update:     in flake.nix die Version in der riftlinux-URL ändern, dann"
 echo "            sudo nixos-rebuild switch --flake ${NIXOS_DIR}#${HOST}"
 if ((CONVERT)); then
