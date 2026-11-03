@@ -19,9 +19,10 @@ Die erste Frage ist **„Erweiterte Optionen anzeigen?“** (Standard: nein). Nu
 
 In der Plattenauswahl stehen NVMe-SSDs oben (vorausgewählt ist die erste), USB-Sticks und Wechseldatenträger unten.
 
-Jede Frage lässt sich per Variable vorbelegen und wird dann übersprungen, z. B. die Zielplatte:
-`DISK=/dev/nvme0n1 sudo bash i.sh`. Die Variablen dürfen vor oder nach `sudo` stehen; `sudo` verwirft sie zwar,
-das Skript holt die bekannten Namen aber aus dem Aufruf zurück und zeigt an, welche es übernommen hat.
+Jede Frage lässt sich vorbelegen und wird dann übersprungen, z. B. die Zielplatte, als Argument
+(`sudo bash i.sh DISK=/dev/nvme0n1`) oder als Umgebungsvariable (`DISK=/dev/nvme0n1 sudo bash i.sh`).
+Umgebungsvariablen dürfen vor oder nach `sudo` stehen; `sudo` verwirft sie zwar, das Skript holt die bekannten Namen
+aber aus dem Aufruf zurück. Es zeigt an, was es übernommen hat; Argumente haben Vorrang.
 
 Tastatur, Sprache und Zeitzone schlägt das Skript passend vor: aus dem Live-System (grafischer Stick) oder nach Standort
 über den GeoIP-Dienst von Ubuntu (`geoip.ubuntu.com`, abschaltbar mit `GEOIP=n`).

@@ -8,8 +8,9 @@
 # Aufruf im NixOS-Live-System als root:
 #   bash nixos-btrfs-install.sh
 #
-# Jede Abfrage lässt sich per Umgebungsvariable vorbelegen, z. B.:
+# Jede Abfrage lässt sich per Umgebungsvariable oder Argument vorbelegen, z. B.:
 #   DISK=/dev/nvme0n1 CHANNEL=release KB=de DESKTOP=plasma NIX_USER=alice bash nixos-btrfs-install.sh
+#   bash nixos-btrfs-install.sh DISK=/dev/nvme0n1 DESKTOP=plasma
 # Auch vor sudo (DISK=/dev/nvme0n1 sudo bash i.sh): bekannte Namen werden aus dem sudo-Aufruf übernommen.
 #
 # Antworten einer früheren Installation wiederverwenden (dort unter /etc/nixos/install-antworten.env):
@@ -2092,6 +2093,19 @@ PKG_NIX+='
 LOG=/tmp/nixos-install-$(date +%Y%m%d-%H%M%S).log
 exec > >(tee -a "$LOG") 2>&1
 echo "Protokoll: $LOG"
+# Vorgaben auch als Argumente: ./i.sh DISK=/dev/nvme0n1 DESKTOP=plasma (haben Vorrang vor Umgebungsvariablen)
+ARG_NAMES=""
+for arg in "$@"; do
+  if [[ $arg =~ ^([A-Z][A-Z0-9_]*)=(.*)$ ]] && [[ " ${IMPORT_VARS[*]} " == *" ${BASH_REMATCH[1]} "* ]]; then
+    printf -v "${BASH_REMATCH[1]}" '%s' "${BASH_REMATCH[2]}"
+    ARG_NAMES+=" ${BASH_REMATCH[1]}"
+  elif [[ $arg =~ ^[A-Za-z][A-Za-z0-9_]*= ]]; then
+    die "Unbekannte Vorgabe: ${arg%%=*} (Liste im Kopf des Skripts)"
+  else
+    die "Unbekanntes Argument: $arg (erwartet NAME=wert, z. B. DISK=/dev/nvme0n1)"
+  fi
+done
+if [[ -n $ARG_NAMES ]]; then echo "  Als Argument übernommen:$ARG_NAMES"; fi
 import_sudo_env
 
 if [[ -n ${ANTWORTEN:-} ]]; then
@@ -2233,7 +2247,7 @@ if [[ $INSTALL_MODE == dualboot ]]; then
 else
   choose DISK "Auf welchen Datenträger soll NixOS? (wird KOMPLETT gelöscht)" 1 "${DISK_OPTS[@]}"
 fi
-[[ -b $DISK ]] || die "$DISK ist kein Blockgerät."
+[[ -b $DISK ]] || die "$DISK gibt es nicht. Vorhandene Platten: $(printf '%s ' "${DISK_OPTS[@]%%|*}")"
 [[ $(lsblk -dno TYPE "$DISK") == disk ]] || die "$DISK ist keine ganze Platte."
 [[ $DISK != "$LIVE_DEV" ]] || die "$DISK ist das Installationsmedium."
 # Nie die Platte des laufenden Systems anfassen
