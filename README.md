@@ -214,6 +214,28 @@ Ohne Abfrage: `GAMING=j STEAM=j EMU_PS2=j EMU_SWITCH=j …`. Ältere Antwortdate
 BIOS, Firmware und Schlüssel (PS2-BIOS, PS3-Firmware, Switch `prod.keys` und Firmware, Xbox-BIOS und MCPX-ROM)
 liefert kein Paket mit, sie kommen aus den eigenen Konsolen.
 
+### Oculus Rift CV1 (RiftLinux)
+
+`install-riftlinux.sh` richtet auf einem fertig installierten NixOS den Rift-CV1-Treiber
+[RiftLinux](https://github.com/AIIX/RiftLinux) ein (SteamVR und OpenXR, Headset, Sensoren und Touch-Controller):
+
+```bash
+curl -L is.gd/nixosrift -o rift.sh && sudo bash rift.sh
+```
+
+Langform: `https://raw.githubusercontent.com/AgentK7/nixos-btrfs-install/main/install-riftlinux.sh`
+
+- Stellt `/etc/nixos` auf Flakes um. Channel-Importe, wie sie dieser Installer anlegt (`<home-manager/nixos>`,
+  `<nixos-hardware/…>`), werden zu Flake-Inputs, ebenso `<nixpkgs/…>`, weitere Channels und `builtins.fetchTarball`
+  ohne Hash. Vorher wird `/etc/nixos` nach `/etc/nixos.bak-<Datum>` gesichert, scheitert der Build, wird zurückgesetzt.
+- Paketiert das offizielle Release in `/etc/nixos/riftlinux.nix` (der SteamVR-Treiber bleibt unverändert, wie
+  RiftLinux es verlangt): udev-Regeln, Anmeldung bei SteamVR beim Login und Einstecken, rtkit, Steam.
+- Gibt es schon eine `flake.nix`, legt es nur `riftlinux.nix` an und nennt die Zeilen zum Ergänzen.
+- Danach Steam einmal neu starten, Rift anstecken und SteamVR starten; `riftlinux-setup check` prüft die Einrichtung.
+
+Geprüft mit den Konfigurationen aller Test-Szenarien (`tests/szenarien/`), u. a. UKI mit lanzaboote, home-manager und
+nixos-hardware: Nach der Umstellung wertet jedes System vollständig aus. Mit einem echten Headset ist es noch nicht getestet.
+
 ## Weitere Programme
 
 Mit Desktop fragt das Skript, ob weitere Programme dazukommen sollen. Erst werden Kategorien angekreuzt,
@@ -277,6 +299,7 @@ Installation daran scheitert: `tests/eval.sh release` oder `tests/eval.sh unstab
 
 - Fingerabdruck einlernen: `fprintd-enroll` oder Systemeinstellungen → Benutzer
 - Zweiten YubiKey als Ersatz für sudo: `pamu2fcfg -n -o pam://<hostname> -i pam://<hostname> >> ~/.config/Yubico/u2f_keys`
-- Kanäle (nixos, home-manager, nixos-hardware) aktualisieren: `sudo nix-channel --update`, dann `sudo nixos-rebuild switch`
+- Kanäle (nixos, home-manager, nixos-hardware) aktualisieren: `sudo nix-channel --update`, dann `sudo nixos-rebuild switch`.
+  Nach `install-riftlinux.sh` (Flakes) stattdessen: `sudo nix flake update --flake /etc/nixos`, dann `sudo nixos-rebuild switch`
 
 **Achtung:** Ohne Dual-Boot wird die gewählte Platte komplett gelöscht.
